@@ -46,12 +46,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Environment ────────────────────────────────────────────────────────────────
-BOT_TOKEN:       str       = os.environ["BOT_TOKEN"]
-ADMIN_GROUP_ID:  int       = int(os.environ["ADMIN_GROUP_ID"])
-ADMIN_IDS:       list[int] = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
-PAYEER_ADDRESS:  str       = os.environ.get("PAYEER_ADDRESS", "P1000000")
-BOT_NAME:        str       = os.environ.get("BOT_NAME", "CompressBot")
-FREE_DAILY_LIMIT: int      = int(os.environ.get("FREE_DAILY_LIMIT", "5"))
+BOT_TOKEN:        str       = os.environ["BOT_TOKEN"]
+ADMIN_GROUP_ID:   int       = int(os.environ["ADMIN_GROUP_ID"])
+ADMIN_IDS:        list[int] = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
+PAYEER_ADDRESS:   str       = os.environ.get("PAYEER_ADDRESS", "P1000000")
+BOT_NAME:         str       = os.environ.get("BOT_NAME", "CompressBot")
+FREE_DAILY_LIMIT: int       = int(os.environ.get("FREE_DAILY_LIMIT", "5"))
 
 # ── Conversation states ────────────────────────────────────────────────────────
 AWAITING_PAYMENT_PROOF = 1
@@ -90,18 +90,6 @@ def is_admin(user_id: int) -> bool:
 #  HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def forward_to_admin_group(bot: Bot, message: Message) -> None:
-    """Silently forward every incoming message to the admin monitoring group."""
-    try:
-        await bot.forward_message(
-            chat_id=ADMIN_GROUP_ID,
-            from_chat_id=message.chat_id,
-            message_id=message.message_id,
-        )
-    except TelegramError as e:
-        logger.warning("Forward to admin group failed: %s", e)
-
-
 async def check_user_access(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> tuple[dict | None, bool]:
@@ -109,17 +97,16 @@ async def check_user_access(
     Returns (user_doc, can_proceed).
 
     Access rules:
-    - Banned users      → blocked with a message, returns False.
-    - Admins (ADMIN_IDS)→ always granted, treated as premium (no watermarks,
-                          no daily limit), skips DB tier checks entirely.
-    - Premium users     → always granted.
-    - Free users        → granted until FREE_DAILY_LIMIT is reached.
+    - Banned users       → blocked with a message, returns False.
+    - Admins (ADMIN_IDS) → always granted, treated as premium (no watermarks,
+                           no daily limit), skips DB tier checks entirely.
+    - Premium users      → always granted.
+    - Free users         → granted until FREE_DAILY_LIMIT is reached.
     """
     user     = update.effective_user
     user_doc = await db.upsert_user(user.id, user.username, user.full_name)
 
-    # ── Ban check (admins can never be banned from the bot's perspective,
-    #    but we still respect the DB flag for non-admins) ──────────────────────
+    # ── Ban check ─────────────────────────────────────────────────────────────
     if user_doc.get("is_banned") and not is_admin(user.id):
         await update.message.reply_text(
             "⚠️ Your access has been restricted by the administrator."
@@ -128,8 +115,6 @@ async def check_user_access(
 
     # ── Admin bypass — unlimited, no watermarks ───────────────────────────────
     if is_admin(user.id):
-        # Inject a synthetic premium status so downstream code
-        # (caption logic, etc.) treats this user as premium.
         user_doc = {**user_doc, "status": "premium"}
         return user_doc, True
 
@@ -150,15 +135,75 @@ async def check_user_access(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MIDDLEWARE  — Forwarding Spy
+#  MIDDLEWARE — Forwarding Spy
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def spy_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Global handler (group 99): forwards every update to the admin group."""
-    if update.message:
-        await forward_to_admin_group(context.bot, update.message)
-    elif update.edited_message:
-        await forward_to_admin_group(context.bot, update.edited_message)
+    """
+    Group-99 handler. Fires after every update regardless of what group-0 did.
+
+    Strategy:
+    - Photos / videos / GIFs
+        → copy_message with a custom caption embedding user info.
+          Keeps media and metadata in a single bubble.
+
+    - Everything else (text, commands, stickers, audio, voice, docs, etc.)
+        → send_message with the HTML header THEN forward_message so admins
+          see full context (reply chains, sticker pack names, waveforms, etc.)
+    """
+    message = update.message or update.edited_message
+    if not message:
+        return
+
+    user = message.from_user
+    if not user:
+        return
+
+    # ── Build the user info header (HTML) ─────────────────────────────────────
+    full_name = user.full_name or "—"
+    username  = f"@{user.username}" if user.username else "None"
+
+    header = (
+        "👤 <b>User Activity</b>\n"
+        f"├ <b>Name:</b> {full_name}\n"
+        f"├ <b>Username:</b> {username}\n"
+        f"└ <b>User ID:</b> <code>{user.id}</code>"
+    )
+
+    # ── Detect media that supports copy_message captions ──────────────────────
+    is_media = bool(message.photo or message.video or message.animation)
+
+    try:
+        if is_media:
+            # Preferred path — one bubble with file + user info in caption
+            existing_caption = message.caption or ""
+            combined_caption = (
+                f"{header}\n"
+                + (f"\n📝 <i>Original caption:</i> {existing_caption}" if existing_caption else "")
+            )
+            await context.bot.copy_message(
+                chat_id=ADMIN_GROUP_ID,
+                from_chat_id=message.chat_id,
+                message_id=message.message_id,
+                caption=combined_caption[:1024],   # Telegram caption limit
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            # Standard path — header first, then native forward
+            await context.bot.send_message(
+                chat_id=ADMIN_GROUP_ID,
+                text=header,
+                parse_mode=ParseMode.HTML,
+            )
+            await context.bot.forward_message(
+                chat_id=ADMIN_GROUP_ID,
+                from_chat_id=message.chat_id,
+                message_id=message.message_id,
+            )
+
+    except TelegramError as e:
+        # Never let a spy failure affect the user-facing response
+        logger.warning("spy_middleware failed for user %s: %s", user.id, e)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -169,15 +214,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     await db.upsert_user(user.id, user.username, user.full_name)
     await update.message.reply_text(
-        f"👋 Welcome to *{BOT_NAME}*!\n\n"
-        "Send me a *video*, *audio*, *voice message*, or *photo* and I'll compress it.\n\n"
-        "📦 *Free tier*: 5 files/day\n"
-        "⭐ *Premium*: Unlimited — /upgrade\n\n"
+        f"👋 Welcome to <b>{BOT_NAME}</b>!\n\n"
+        "Send me a <b>video</b>, <b>audio</b>, <b>voice message</b>, or <b>photo</b> and I'll compress it.\n\n"
+        "📦 <b>Free tier:</b> 5 files/day\n"
+        "⭐ <b>Premium:</b> Unlimited — /upgrade\n\n"
         "Commands:\n"
         "/start — Show this message\n"
         "/upgrade — Get Premium ($1/month)\n"
         "/status — Your current plan",
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -188,24 +233,23 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     status   = user_doc.get("status", "free")
     expiry   = user_doc.get("expiry_date")
 
-    # Admins always show as premium
     if is_admin(user.id):
         status = "premium (admin)"
 
-    lines = [f"👤 *Status*: {'⭐ Premium' if 'premium' in status else '🆓 Free'}"]
+    lines = [f"👤 <b>Status:</b> {'⭐ Premium' if 'premium' in status else '🆓 Free'}"]
     if "premium" in status and expiry:
         if isinstance(expiry, str):
             expiry = datetime.fromisoformat(expiry)
         if expiry.tzinfo is None:
             expiry = expiry.replace(tzinfo=timezone.utc)
         days_left = (expiry - datetime.now(timezone.utc)).days
-        lines.append(f"📅 *Expires*: {expiry.strftime('%Y-%m-%d')} ({days_left} days left)")
+        lines.append(f"📅 <b>Expires:</b> <code>{expiry.strftime('%Y-%m-%d')}</code> ({days_left} days left)")
     elif is_admin(user.id):
-        lines.append("♾️ *Unlimited access* (admin)")
+        lines.append("♾️ <b>Unlimited access</b> (admin)")
     else:
-        lines.append(f"📊 *Today's usage*: {usage}/{FREE_DAILY_LIMIT} files")
+        lines.append(f"📊 <b>Today's usage:</b> {usage}/{FREE_DAILY_LIMIT} files")
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -214,12 +258,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
-        "⭐ *Upgrade to Premium — $1/month*\n\n"
-        f"Send *$1 USD* via Payeer to:\n`{PAYEER_ADDRESS}`\n\n"
-        "Then *send a screenshot* of your payment confirmation here.\n"
+        "⭐ <b>Upgrade to Premium — $1/month</b>\n\n"
+        f"Send <b>$1 USD</b> via Payeer to:\n<code>{PAYEER_ADDRESS}</code>\n\n"
+        "Then <b>send a screenshot</b> of your payment confirmation here.\n"
         "An admin will verify and activate your account within a few hours.\n\n"
         "Send /cancel to abort.",
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
     return AWAITING_PAYMENT_PROOF
 
@@ -232,16 +276,16 @@ async def receive_payment_proof(
 
     if not message.photo:
         await message.reply_text(
-            "❌ Please send a *screenshot* (photo) of your payment.",
-            parse_mode=ParseMode.MARKDOWN,
+            "❌ Please send a <b>screenshot</b> (photo) of your payment.",
+            parse_mode=ParseMode.HTML,
         )
         return AWAITING_PAYMENT_PROOF
 
     uname   = f"@{user.username}" if user.username else user.full_name
     caption = (
-        f"💰 *Payment Proof*\n"
+        f"💰 <b>Payment Proof</b>\n"
         f"User: {uname}\n"
-        f"ID: `{user.id}`\n"
+        f"ID: <code>{user.id}</code>\n"
         f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
     )
     keyboard = InlineKeyboardMarkup([[
@@ -253,7 +297,7 @@ async def receive_payment_proof(
         chat_id=ADMIN_GROUP_ID,
         photo=message.photo[-1].file_id,
         caption=caption,
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
     )
     await message.reply_text(
@@ -283,16 +327,16 @@ async def callback_approve(
         await context.bot.send_message(
             chat_id=target_id,
             text=(
-                "🎉 *Congratulations! Your Premium is now active!*\n\n"
-                f"✅ Valid until: `{expiry}`\n"
+                "🎉 <b>Congratulations! Your Premium is now active!</b>\n\n"
+                f"✅ Valid until: <code>{expiry}</code>\n"
                 "Enjoy unlimited compressions with no watermarks!"
             ),
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
         await query.edit_message_caption(
             caption=query.message.caption
-            + f"\n\n✅ *Approved by {query.from_user.full_name}*",
-            parse_mode=ParseMode.MARKDOWN,
+            + f"\n\n✅ <b>Approved by {query.from_user.full_name}</b>",
+            parse_mode=ParseMode.HTML,
         )
     else:
         await query.answer("User not found in DB.", show_alert=True)
@@ -309,16 +353,16 @@ async def callback_reject(
     await context.bot.send_message(
         chat_id=target_id,
         text=(
-            "❌ *Your payment proof was rejected.*\n\n"
+            "❌ <b>Your payment proof was rejected.</b>\n\n"
             "The screenshot did not meet verification requirements.\n"
             "Please ensure you send a clear, unedited screenshot and try /upgrade again."
         ),
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
     await query.edit_message_caption(
         caption=query.message.caption
-        + f"\n\n❌ *Rejected by {query.from_user.full_name}*",
-        parse_mode=ParseMode.MARKDOWN,
+        + f"\n\n❌ <b>Rejected by {query.from_user.full_name}</b>",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -370,11 +414,11 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         InlineKeyboardButton("🟢 High",   callback_data="video_high"),
     ]])
     await update.message.reply_text(
-        "📹 Choose compression level:\n"
-        "• *Low* — smaller file, lower quality\n"
-        "• *Medium* — balanced (recommended)\n"
-        "• *High* — best quality, largest file",
-        parse_mode=ParseMode.MARKDOWN,
+        "📹 <b>Choose compression level:</b>\n"
+        "• <b>Low</b> — smaller file, lower quality\n"
+        "• <b>Medium</b> — balanced (recommended)\n"
+        "• <b>High</b> — best quality, largest file",
+        parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
     )
     context.user_data["pending_video_msg_id"]  = update.message.message_id
@@ -419,7 +463,7 @@ async def compress_video_callback(
         out_path = Path(tmpdir) / "output.mp4"
         await tg_file.download_to_drive(str(in_path))
 
-        cmd  = [
+        cmd = [
             "ffmpeg", "-y", "-i", str(in_path),
             "-vcodec", "libx264", "-crf", str(crf),
             "-preset", "fast", "-acodec", "aac", "-b:a", "128k",
@@ -470,7 +514,7 @@ async def handle_audio_voice(
         out_path = Path(tmpdir) / "output.ogg"
         await tg_file.download_to_drive(str(in_path))
 
-        cmd  = [
+        cmd = [
             "ffmpeg", "-y", "-i", str(in_path),
             "-c:a", "libopus", "-b:a", "32k",
             "-vbr", "on", "-compression_level", "10",
@@ -509,24 +553,26 @@ async def handle_audio_voice(
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     stats = await db.get_stats()
     await update.message.reply_text(
-        "📊 *Bot Statistics*\n\n"
-        f"👥 Total users:   `{stats['total_users']}`\n"
-        f"⭐ Premium users: `{stats['premium_users']}`\n"
-        f"🚫 Banned users:  `{stats['banned_users']}`\n"
-        f"📁 Files today:   `{stats['files_today']}`",
-        parse_mode=ParseMode.MARKDOWN,
+        "📊 <b>Bot Statistics</b>\n\n"
+        f"👥 Total users:   <code>{stats['total_users']}</code>\n"
+        f"⭐ Premium users: <code>{stats['premium_users']}</code>\n"
+        f"🚫 Banned users:  <code>{stats['banned_users']}</code>\n"
+        f"📁 Files today:   <code>{stats['files_today']}</code>",
+        parse_mode=ParseMode.HTML,
     )
 
 
 @admin_only
 async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: `/ban <user_id>`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("Usage: <code>/ban &lt;user_id&gt;</code>", parse_mode=ParseMode.HTML)
         return
     uid     = int(context.args[0])
     success = await db.update_ban_status(uid, True)
     if success:
-        await update.message.reply_text(f"🚫 User `{uid}` has been banned.", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            f"🚫 User <code>{uid}</code> has been banned.", parse_mode=ParseMode.HTML
+        )
         try:
             await context.bot.send_message(
                 chat_id=uid,
@@ -535,18 +581,22 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except TelegramError:
             pass
     else:
-        await update.message.reply_text(f"⚠️ User `{uid}` not found in DB.", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            f"⚠️ User <code>{uid}</code> not found in DB.", parse_mode=ParseMode.HTML
+        )
 
 
 @admin_only
 async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: `/unban <user_id>`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("Usage: <code>/unban &lt;user_id&gt;</code>", parse_mode=ParseMode.HTML)
         return
     uid     = int(context.args[0])
     success = await db.update_ban_status(uid, False)
     if success:
-        await update.message.reply_text(f"✅ User `{uid}` has been unbanned.", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            f"✅ User <code>{uid}</code> has been unbanned.", parse_mode=ParseMode.HTML
+        )
         try:
             await context.bot.send_message(
                 chat_id=uid,
@@ -555,15 +605,17 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except TelegramError:
             pass
     else:
-        await update.message.reply_text(f"⚠️ User `{uid}` not found in DB.", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            f"⚠️ User <code>{uid}</code> not found in DB.", parse_mode=ParseMode.HTML
+        )
 
 
 @admin_only
 async def cmd_setpremium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.message.reply_text(
-            "Usage: `/setpremium <user_id> [days]`\nDefault days: 30",
-            parse_mode=ParseMode.MARKDOWN,
+            "Usage: <code>/setpremium &lt;user_id&gt; [days]</code>\nDefault days: 30",
+            parse_mode=ParseMode.HTML,
         )
         return
     uid     = int(context.args[0])
@@ -572,24 +624,24 @@ async def cmd_setpremium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if success:
         expiry = (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%Y-%m-%d")
         await update.message.reply_text(
-            f"⭐ User `{uid}` is now Premium until `{expiry}`.",
-            parse_mode=ParseMode.MARKDOWN,
+            f"⭐ User <code>{uid}</code> is now Premium until <code>{expiry}</code>.",
+            parse_mode=ParseMode.HTML,
         )
         try:
             await context.bot.send_message(
                 chat_id=uid,
                 text=(
-                    f"🎉 *An admin has granted you Premium access!*\n"
-                    f"✅ Valid until: `{expiry}`\n"
+                    f"🎉 <b>An admin has granted you Premium access!</b>\n"
+                    f"✅ Valid until: <code>{expiry}</code>\n"
                     "Enjoy unlimited compressions with no watermarks!"
                 ),
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode=ParseMode.HTML,
             )
         except TelegramError:
             pass
     else:
         await update.message.reply_text(
-            f"⚠️ User `{uid}` not found in DB.", parse_mode=ParseMode.MARKDOWN
+            f"⚠️ User <code>{uid}</code> not found in DB.", parse_mode=ParseMode.HTML
         )
 
 
@@ -597,14 +649,14 @@ async def cmd_setpremium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def cmd_depremium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.message.reply_text(
-            "Usage: `/depremium <user_id>`", parse_mode=ParseMode.MARKDOWN
+            "Usage: <code>/depremium &lt;user_id&gt;</code>", parse_mode=ParseMode.HTML
         )
         return
     uid     = int(context.args[0])
     success = await db.revoke_premium(uid)
     if success:
         await update.message.reply_text(
-            f"⬇️ User `{uid}` reverted to Free tier.", parse_mode=ParseMode.MARKDOWN
+            f"⬇️ User <code>{uid}</code> reverted to Free tier.", parse_mode=ParseMode.HTML
         )
         try:
             await context.bot.send_message(
@@ -615,7 +667,7 @@ async def cmd_depremium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             pass
     else:
         await update.message.reply_text(
-            f"⚠️ User `{uid}` not found in DB.", parse_mode=ParseMode.MARKDOWN
+            f"⚠️ User <code>{uid}</code> not found in DB.", parse_mode=ParseMode.HTML
         )
 
 
@@ -623,53 +675,46 @@ async def cmd_depremium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def cmd_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /send <user_id|@username> <message text…>
-
-    Accepts a numeric user_id OR a @username (with or without the @).
-    Everything after the first token is treated as the message body,
-    so multi-word messages work naturally.
+    Everything after the first token is the message body — multi-word safe.
     """
     if len(context.args) < 2:
         await update.message.reply_text(
-            "Usage: `/send <user_id or @username> <message>`",
-            parse_mode=ParseMode.MARKDOWN,
+            "Usage: <code>/send &lt;user_id or @username&gt; &lt;message&gt;</code>",
+            parse_mode=ParseMode.HTML,
         )
         return
 
     target_token = context.args[0]
-    text         = " ".join(context.args[1:])  # preserves multi-word messages
-
-    # ── Resolve target to a numeric chat_id ───────────────────────────────────
+    text         = " ".join(context.args[1:])
     target_id: int | None = None
 
     if target_token.lstrip("@").isdigit():
         target_id = int(target_token.lstrip("@"))
     else:
-        # Username lookup — strips leading '@' inside the helper
         user_doc = await db.get_user_by_username(target_token)
         if user_doc:
             target_id = user_doc["user_id"]
 
     if target_id is None:
         await update.message.reply_text(
-            f"⚠️ Could not find a user matching `{target_token}` in the database.",
-            parse_mode=ParseMode.MARKDOWN,
+            f"⚠️ Could not find a user matching <code>{target_token}</code> in the database.",
+            parse_mode=ParseMode.HTML,
         )
         return
 
-    # ── Send the message ──────────────────────────────────────────────────────
     try:
         await context.bot.send_message(
             chat_id=target_id,
-            text=f"📩 *Message from Admin:*\n\n{text}",
-            parse_mode=ParseMode.MARKDOWN,
+            text=f"📩 <b>Message from Admin:</b>\n\n{text}",
+            parse_mode=ParseMode.HTML,
         )
         await update.message.reply_text(
-            f"✅ Message delivered to `{target_id}`.", parse_mode=ParseMode.MARKDOWN
+            f"✅ Message delivered to <code>{target_id}</code>.", parse_mode=ParseMode.HTML
         )
     except Forbidden:
         await update.message.reply_text(
-            f"❌ Cannot send: user `{target_id}` has blocked the bot.",
-            parse_mode=ParseMode.MARKDOWN,
+            f"❌ Cannot send: user <code>{target_id}</code> has blocked the bot.",
+            parse_mode=ParseMode.HTML,
         )
     except TelegramError as e:
         await update.message.reply_text(f"❌ Delivery failed: {e}")
@@ -678,13 +723,15 @@ async def cmd_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @admin_only
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Safe-broadcast with:
-    - 0.05 s delay between sends  (~20 msg/s, under Telegram's 30/s limit)
-    - Forbidden  → user blocked the bot, counted as failed, continue
-    - RetryAfter → Telegram flood-wait, sleep the required time then retry once
+    Safe broadcast with:
+    - 0.05 s delay between sends  (~20 msg/s, under Telegram's 30/s hard limit)
+    - Forbidden  → user blocked the bot, counted as failed, loop continues
+    - RetryAfter → flood-wait honoured with sleep + single retry
     """
     if not context.args:
-        await update.message.reply_text("Usage: `/broadcast <message>`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            "Usage: <code>/broadcast &lt;message&gt;</code>", parse_mode=ParseMode.HTML
+        )
         return
 
     text       = " ".join(context.args)
@@ -693,31 +740,29 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     sent = failed = 0
 
     status_msg = await update.message.reply_text(
-        f"📢 Starting broadcast to *{total}* users…", parse_mode=ParseMode.MARKDOWN
+        f"📢 Starting broadcast to <b>{total}</b> users…", parse_mode=ParseMode.HTML
     )
 
     for uid in user_ids:
         try:
             await context.bot.send_message(
                 chat_id=uid,
-                text=f"📢 *Announcement*\n\n{text}",
-                parse_mode=ParseMode.MARKDOWN,
+                text=f"📢 <b>Announcement</b>\n\n{text}",
+                parse_mode=ParseMode.HTML,
             )
             sent += 1
 
         except Forbidden:
-            # User blocked the bot — skip silently
             failed += 1
 
         except RetryAfter as e:
-            # Telegram asked us to back off — honour the wait, then retry once
             logger.warning("Flood control: sleeping %s s", e.retry_after)
             await asyncio.sleep(e.retry_after + 1)
             try:
                 await context.bot.send_message(
                     chat_id=uid,
-                    text=f"📢 *Announcement*\n\n{text}",
-                    parse_mode=ParseMode.MARKDOWN,
+                    text=f"📢 <b>Announcement</b>\n\n{text}",
+                    parse_mode=ParseMode.HTML,
                 )
                 sent += 1
             except TelegramError:
@@ -726,14 +771,14 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         except TelegramError:
             failed += 1
 
-        await asyncio.sleep(0.05)   # ~20 messages per second
+        await asyncio.sleep(0.05)
 
     await status_msg.edit_text(
-        f"✅ Broadcast complete.\n\n"
-        f"✅ Successful: *{sent}*\n"
-        f"❌ Failed/Blocked: *{failed}*\n"
-        f"📊 Total: *{total}*",
-        parse_mode=ParseMode.MARKDOWN,
+        "✅ <b>Broadcast complete.</b>\n\n"
+        f"✅ Successful: <b>{sent}</b>\n"
+        f"❌ Failed/Blocked: <b>{failed}</b>\n"
+        f"📊 Total: <b>{total}</b>",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -755,11 +800,11 @@ async def job_check_subscriptions(bot: Bot) -> None:
             await bot.send_message(
                 chat_id=user["user_id"],
                 text=(
-                    f"⏰ *Subscription Reminder*\n\n"
+                    f"⏰ <b>Subscription Reminder</b>\n\n"
                     f"Your Premium expires in ~{hours_left} hours.\n"
                     "Renew with /upgrade to stay unlimited!"
                 ),
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode=ParseMode.HTML,
             )
         except TelegramError:
             pass
@@ -820,7 +865,7 @@ def build_application() -> Application:
     app.add_handler(MessageHandler(filters.VIDEO  & ~filters.COMMAND, handle_video))
     app.add_handler(MessageHandler((filters.AUDIO | filters.VOICE) & ~filters.COMMAND, handle_audio_voice))
 
-    # ── Spy middleware (group 99 — runs independently of group 0) ─────────────
+    # ── Spy middleware (group 99 — fully independent of group 0) ──────────────
     app.add_handler(MessageHandler(filters.ALL, spy_middleware), group=99)
 
     return app
