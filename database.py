@@ -22,7 +22,6 @@ class Database:
         self.db = self.client[os.environ.get("DB_NAME", "compressor_bot")]
         self.users = self.db["users"]
 
-        # Indexes
         await self.users.create_index([("user_id", ASCENDING)], unique=True)
         await self.users.create_index([("expiry_date", ASCENDING)])
         print("✅ Connected to MongoDB Atlas")
@@ -41,22 +40,22 @@ class Database:
         result = await self.users.find_one_and_update(
             {"user_id": user_id},
             {
+                # Written ONCE on document creation only — never overlaps with $set
                 "$setOnInsert": {
-                    "user_id": user_id,
-                    "username": username,
-                    "full_name": full_name,
-                    "status": "free",
-                    "daily_usage": 0,
+                    "user_id":        user_id,
+                    "status":         "free",
+                    "daily_usage":    0,
                     "usage_reset_at": now,
-                    "expiry_date": None,
-                    "is_banned": False,
-                    "created_at": now,
-                    "total_files": 0,
+                    "expiry_date":    None,
+                    "is_banned":      False,
+                    "total_files":    0,
+                    "created_at":     now,
                 },
+                # Refreshed on every interaction — keys are strictly disjoint from $setOnInsert
                 "$set": {
-                    "last_seen": now,
-                    "username": username,
+                    "username":  username,
                     "full_name": full_name,
+                    "last_seen": now,
                 },
             },
             upsert=True,
@@ -80,13 +79,10 @@ class Database:
         reset_at = user.get("usage_reset_at", now)
         if isinstance(reset_at, str):
             reset_at = datetime.fromisoformat(reset_at)
-
-        # Make reset_at timezone-aware if it isn't
         if reset_at.tzinfo is None:
             reset_at = reset_at.replace(tzinfo=timezone.utc)
 
         if (now - reset_at).total_seconds() >= 86400:
-            # Reset counter
             await self.users.update_one(
                 {"user_id": user_id},
                 {"$set": {"daily_usage": 1, "usage_reset_at": now}},
@@ -194,10 +190,10 @@ class Database:
         files_today = agg[0]["total"] if agg else 0
 
         return {
-            "total_users": total,
+            "total_users":   total,
             "premium_users": premium,
-            "banned_users": banned,
-            "files_today": files_today,
+            "banned_users":  banned,
+            "files_today":   files_today,
         }
 
     async def get_all_user_ids(self) -> list[int]:
