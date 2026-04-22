@@ -24,6 +24,7 @@ class Database:
 
         await self.users.create_index([("user_id", ASCENDING)], unique=True)
         await self.users.create_index([("expiry_date", ASCENDING)])
+        await self.users.create_index([("username", ASCENDING)])  # for /send lookups
         print("✅ Connected to MongoDB Atlas")
 
     async def close(self):
@@ -35,12 +36,24 @@ class Database:
     async def get_user(self, user_id: int) -> Optional[dict]:
         return await self.users.find_one({"user_id": user_id})
 
-    async def upsert_user(self, user_id: int, username: str = None, full_name: str = None) -> dict:
+    async def get_user_by_username(self, username: str) -> Optional[dict]:
+        """
+        Case-insensitive username lookup.
+        Strips a leading '@' if the caller included one.
+        """
+        clean = username.lstrip("@")
+        return await self.users.find_one(
+            {"username": {"$regex": f"^{clean}$", "$options": "i"}}
+        )
+
+    async def upsert_user(
+        self, user_id: int, username: str = None, full_name: str = None
+    ) -> dict:
         now = datetime.now(timezone.utc)
         result = await self.users.find_one_and_update(
             {"user_id": user_id},
             {
-                # Written ONCE on document creation only — never overlaps with $set
+                # Written ONCE on document creation — keys never overlap with $set
                 "$setOnInsert": {
                     "user_id":        user_id,
                     "status":         "free",
@@ -51,7 +64,7 @@ class Database:
                     "total_files":    0,
                     "created_at":     now,
                 },
-                # Refreshed on every interaction — keys are strictly disjoint from $setOnInsert
+                # Refreshed on every interaction
                 "$set": {
                     "username":  username,
                     "full_name": full_name,
@@ -70,7 +83,7 @@ class Database:
     # ── Usage tracking ─────────────────────────────────────────────────────────
 
     async def increment_usage(self, user_id: int) -> int:
-        """Increment daily usage counter, auto-reset after 24h. Returns new count."""
+        """Increment daily usage counter, auto-reset after 24 h. Returns new count."""
         now = datetime.now(timezone.utc)
         user = await self.get_user(user_id)
         if not user:
@@ -110,9 +123,35 @@ class Database:
             return 0
         return user.get("daily_usage", 0)
 
+    # ── Ban management ─────────────────────────────────────────────────────────
+
+    async def update_ban_status(self, user_id: int, banned: bool) -> bool:
+        """
+        Set is_banned to True or False.
+        Returns True if a document was actually modified.
+        """
+        result = await self.users.update_one(
+            {"user_id": user_id},
+            {"$set": {"is_banned": banned}},
+        )
+        return result.modified_count > 0
+
+    # kept for backwards-compat with any existing call sites
+    async def ban_user(self, user_id: int) -> bool:
+        return await self.update_ban_status(user_id, True)
+
+    async def unban_user(self, user_id: int) -> bool:
+        return await self.update_ban_status(user_id, False)
+
     # ── Premium management ─────────────────────────────────────────────────────
 
-    async def approve_premium(self, user_id: int, days: int = 30) -> bool:
+    async def set_manual_premium(self, user_id: int, days: int = 30) -> bool:
+        """
+        Grant premium for `days` days.
+        If the user already has premium, the expiry is extended from NOW
+        (not stacked on top of the existing expiry).
+        Returns True if a document was found and modified.
+        """
         expiry = datetime.now(timezone.utc) + timedelta(days=days)
         result = await self.users.update_one(
             {"user_id": user_id},
@@ -120,29 +159,21 @@ class Database:
         )
         return result.modified_count > 0
 
+    # alias used by the payment-approval callback
+    async def approve_premium(self, user_id: int, days: int = 30) -> bool:
+        return await self.set_manual_premium(user_id, days)
+
     async def revoke_premium(self, user_id: int) -> bool:
+        """Immediately revert user to the free tier."""
         result = await self.users.update_one(
             {"user_id": user_id},
             {"$set": {"status": "free", "expiry_date": None}},
         )
         return result.modified_count > 0
 
-    async def ban_user(self, user_id: int) -> bool:
-        result = await self.users.update_one(
-            {"user_id": user_id}, {"$set": {"is_banned": True}}
-        )
-        return result.modified_count > 0
-
-    async def unban_user(self, user_id: int) -> bool:
-        result = await self.users.update_one(
-            {"user_id": user_id}, {"$set": {"is_banned": False}}
-        )
-        return result.modified_count > 0
-
     # ── Subscription scheduler helpers ────────────────────────────────────────
 
     async def get_expiring_soon(self, hours: int = 48) -> list[dict]:
-        """Return premium users whose subscription expires within `hours` hours."""
         now = datetime.now(timezone.utc)
         cutoff = now + timedelta(hours=hours)
         cursor = self.users.find(
@@ -156,7 +187,6 @@ class Database:
         return await cursor.to_list(length=None)
 
     async def get_expired(self) -> list[dict]:
-        """Return premium users whose subscription has already expired."""
         now = datetime.now(timezone.utc)
         cursor = self.users.find(
             {"status": "premium", "expiry_date": {"$lte": now}},
@@ -165,7 +195,6 @@ class Database:
         return await cursor.to_list(length=None)
 
     async def expire_subscriptions(self) -> int:
-        """Downgrade all expired premium users. Returns count."""
         now = datetime.now(timezone.utc)
         result = await self.users.update_many(
             {"status": "premium", "expiry_date": {"$lte": now}},
@@ -173,20 +202,20 @@ class Database:
         )
         return result.modified_count
 
-    # ── Stats ──────────────────────────────────────────────────────────────────
+    # ── Stats & bulk helpers ───────────────────────────────────────────────────
 
     async def get_stats(self) -> dict:
-        total = await self.users.count_documents({})
+        total   = await self.users.count_documents({})
         premium = await self.users.count_documents({"status": "premium"})
-        banned = await self.users.count_documents({"is_banned": True})
+        banned  = await self.users.count_documents({"is_banned": True})
 
-        now = datetime.now(timezone.utc)
+        now       = datetime.now(timezone.utc)
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        pipeline = [
-            {"$match": {"usage_reset_at": {"$gte": day_start}}},
-            {"$group": {"_id": None, "total": {"$sum": "$daily_usage"}}},
+        pipeline  = [
+            {"$match":  {"usage_reset_at": {"$gte": day_start}}},
+            {"$group":  {"_id": None, "total": {"$sum": "$daily_usage"}}},
         ]
-        agg = await self.users.aggregate(pipeline).to_list(length=1)
+        agg         = await self.users.aggregate(pipeline).to_list(length=1)
         files_today = agg[0]["total"] if agg else 0
 
         return {
@@ -198,7 +227,7 @@ class Database:
 
     async def get_all_user_ids(self) -> list[int]:
         cursor = self.users.find({"is_banned": False}, {"user_id": 1})
-        docs = await cursor.to_list(length=None)
+        docs   = await cursor.to_list(length=None)
         return [d["user_id"] for d in docs]
 
 
