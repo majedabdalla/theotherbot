@@ -1,5 +1,5 @@
 # ── Stage 1: Grab the official pre-compiled Telegram Bot API Server ──────────
-FROM aiogram/telegram-bot-api:latest AS api-server
+FROM ghcr.io/tdlib/telegram-bot-api:latest AS api-server
 
 # ── Stage 2: Your actual bot environment ─────────────────────────────────────
 FROM python:3.11-slim
