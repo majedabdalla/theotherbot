@@ -1,28 +1,36 @@
-# ── Base ───────────────────────────────────────────────────────────────────────
+# ── Stage 1: Grab the official pre-compiled Telegram Bot API Server ──────────
+FROM ghcr.io/tdlib/telegram-bot-api:latest AS api-server
+
+# ── Stage 2: Your actual bot environment ─────────────────────────────────────
 FROM python:3.11-slim
 
-# ── System dependencies ────────────────────────────────────────────────────────
+# Copy the API server binary from Stage 1
+COPY --from=api-server /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
+
+# Install system dependencies (curl needed for health-check in start.sh)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libmagic-dev \
     libmagic1 \
     gcc \
+    curl \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Working directory ──────────────────────────────────────────────────────────
 WORKDIR /app
 
-# ── Python dependencies ────────────────────────────────────────────────────────
+# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-# ── Application code ───────────────────────────────────────────────────────────
+# Copy application code and the start script
 COPY . .
 
-# ── Runtime ────────────────────────────────────────────────────────────────────
-# Railway provides PORT, but this bot uses long-polling — no port needed.
+# Make the start script executable
+RUN chmod +x start.sh
+
 ENV PYTHONUNBUFFERED=1
 
-CMD ["python", "main.py"]
+# Run the start script which launches both the API server and the bot
+CMD ["./start.sh"]
