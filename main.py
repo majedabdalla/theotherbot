@@ -819,9 +819,18 @@ async def job_check_subscriptions(bot: Bot) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_application() -> Application:
+    builder = ApplicationBuilder().token(BOT_TOKEN)
+
+    # ── Local Bot API Server Integration ───────────────────────────────────────
+    local_api_url = os.environ.get("LOCAL_BOT_API_URL")
+    if local_api_url:
+        builder.base_url(f"{local_api_url}/bot")
+        builder.base_file_url(f"{local_api_url}/file/bot")
+        builder.local_mode(True)
+        logger.info(f"Configured to use Local Bot API Server at {local_api_url}")
+
     app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
+        builder
         .post_init(on_startup)
         .post_shutdown(on_shutdown)
         .build()
