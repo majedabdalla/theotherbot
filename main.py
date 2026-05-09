@@ -36,6 +36,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 from database import db
 
@@ -54,8 +55,7 @@ PAYEER_ADDRESS:   str       = os.environ.get("PAYEER_ADDRESS", "P1000000")
 BOT_NAME:         str       = os.environ.get("BOT_NAME", "CompressBot")
 FREE_DAILY_LIMIT: int       = int(os.environ.get("FREE_DAILY_LIMIT", "5"))
 
-# ── Thread pool for CPU/IO-heavy work (FFmpeg, Pillow) ────────────────────────
-# Each worker handles one compression job; other users are never blocked.
+# ── Thread pool for CPU/IO-heavy work (Pillow) ────────────────────────────────
 MAX_WORKERS: int = int(os.environ.get("MAX_WORKERS", "3"))
 thread_pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
@@ -123,11 +123,11 @@ async def check_user_access(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  BLOCKING COMPRESSION WORKERS  (run in thread_pool, never block the event loop)
+#  BLOCKING COMPRESSION WORKERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _compress_image_sync(input_bytes: bytes) -> bytes:
-    """Pure CPU work — runs in a thread."""
+    """Pure CPU work — runs in a thread, never blocks the event loop."""
     out_buf = io.BytesIO()
     with Image.open(io.BytesIO(input_bytes)) as img:
         max_side = 2048
@@ -142,7 +142,7 @@ def _compress_image_sync(input_bytes: bytes) -> bytes:
 
 
 async def _run_ffmpeg(cmd: list[str]) -> tuple[int, bytes]:
-    """Run ffmpeg as a subprocess — fully async, does NOT block the event loop."""
+    """Run ffmpeg as an async subprocess — never blocks the event loop."""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.DEVNULL,
@@ -352,7 +352,7 @@ async def callback_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MEDIA COMPRESSION  — concurrent, non-blocking
+#  MEDIA COMPRESSION — concurrent, non-blocking
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -364,12 +364,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     photo = update.message.photo[-1]
     file  = await context.bot.get_file(photo.file_id)
 
-    # Download into memory
     buf = io.BytesIO()
     await file.download_to_memory(buf)
     input_bytes = buf.getvalue()
 
-    # Run Pillow compression in thread pool — does NOT block other users
     loop = asyncio.get_event_loop()
     try:
         output_bytes = await loop.run_in_executor(thread_pool, _compress_image_sync, input_bytes)
@@ -416,7 +414,9 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
     level      = query.data.split("_")[1]
     crf        = CRF_PRESETS[level]
     user_doc   = context.user_data.get("user_doc", {})
-    status_msg = await query.edit_message_text(f"⏳ Compressing video ({level} quality)… this may take a while for large files.")
+    status_msg = await query.edit_message_text(
+        f"⏳ Compressing video ({level} quality)… this may take a while for large files."
+    )
 
     chat_id = context.user_data.get("pending_video_chat_id")
     msg_id  = context.user_data.get("pending_video_msg_id")
@@ -428,7 +428,9 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
             message_id=msg_id,
         )
         video_file_id = (fwd.video or fwd.document).file_id
-        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=fwd.message_id)
+        await context.bot.delete_message(
+            chat_id=update.effective_chat.id, message_id=fwd.message_id
+        )
     except TelegramError:
         await status_msg.edit_text("⚠️ Couldn't retrieve video. Please resend it.")
         return
@@ -439,7 +441,7 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
         in_path  = Path(tmpdir) / "input.mp4"
         out_path = Path(tmpdir) / "output.mp4"
 
-        # Download — async, does not block
+        # Download — async, does not block other users
         await tg_file.download_to_drive(str(in_path))
 
         cmd = [
@@ -454,7 +456,9 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
 
         if returncode != 0:
             logger.error("FFmpeg error: %s", stderr.decode())
-            await status_msg.edit_text("❌ Compression failed. Make sure the video is a valid format.")
+            await status_msg.edit_text(
+                "❌ Compression failed. Make sure the video is a valid format."
+            )
             return
 
         await db.increment_usage(update.effective_user.id)
@@ -462,7 +466,9 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
         caption    = None if is_premium else f"Compressed by {BOT_NAME} (Free Tier)"
 
         with open(out_path, "rb") as f:
-            await query.message.reply_video(video=f, caption=caption, supports_streaming=True)
+            await query.message.reply_video(
+                video=f, caption=caption, supports_streaming=True
+            )
 
     await status_msg.delete()
 
@@ -537,13 +543,20 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid     = int(context.args[0])
     success = await db.update_ban_status(uid, True)
     if success:
-        await update.message.reply_text(f"🚫 User <code>{uid}</code> has been banned.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            f"🚫 User <code>{uid}</code> has been banned.", parse_mode=ParseMode.HTML
+        )
         try:
-            await context.bot.send_message(chat_id=uid, text="⚠️ Your access has been restricted by the administrator.")
+            await context.bot.send_message(
+                chat_id=uid,
+                text="⚠️ Your access has been restricted by the administrator.",
+            )
         except TelegramError:
             pass
     else:
-        await update.message.reply_text(f"⚠️ User <code>{uid}</code> not found in DB.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            f"⚠️ User <code>{uid}</code> not found in DB.", parse_mode=ParseMode.HTML
+        )
 
 
 @admin_only
@@ -554,13 +567,20 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid     = int(context.args[0])
     success = await db.update_ban_status(uid, False)
     if success:
-        await update.message.reply_text(f"✅ User <code>{uid}</code> has been unbanned.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            f"✅ User <code>{uid}</code> has been unbanned.", parse_mode=ParseMode.HTML
+        )
         try:
-            await context.bot.send_message(chat_id=uid, text="✅ Your access has been restored by the administrator.")
+            await context.bot.send_message(
+                chat_id=uid,
+                text="✅ Your access has been restored by the administrator.",
+            )
         except TelegramError:
             pass
     else:
-        await update.message.reply_text(f"⚠️ User <code>{uid}</code> not found in DB.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            f"⚠️ User <code>{uid}</code> not found in DB.", parse_mode=ParseMode.HTML
+        )
 
 
 @admin_only
@@ -593,24 +613,35 @@ async def cmd_setpremium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except TelegramError:
             pass
     else:
-        await update.message.reply_text(f"⚠️ User <code>{uid}</code> not found in DB.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            f"⚠️ User <code>{uid}</code> not found in DB.", parse_mode=ParseMode.HTML
+        )
 
 
 @admin_only
 async def cmd_depremium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: <code>/depremium &lt;user_id&gt;</code>", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            "Usage: <code>/depremium &lt;user_id&gt;</code>", parse_mode=ParseMode.HTML
+        )
         return
     uid     = int(context.args[0])
     success = await db.revoke_premium(uid)
     if success:
-        await update.message.reply_text(f"⬇️ User <code>{uid}</code> reverted to Free tier.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            f"⬇️ User <code>{uid}</code> reverted to Free tier.", parse_mode=ParseMode.HTML
+        )
         try:
-            await context.bot.send_message(chat_id=uid, text="ℹ️ Your Premium subscription has been revoked by an administrator.")
+            await context.bot.send_message(
+                chat_id=uid,
+                text="ℹ️ Your Premium subscription has been revoked by an administrator.",
+            )
         except TelegramError:
             pass
     else:
-        await update.message.reply_text(f"⚠️ User <code>{uid}</code> not found in DB.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            f"⚠️ User <code>{uid}</code> not found in DB.", parse_mode=ParseMode.HTML
+        )
 
 
 @admin_only
@@ -646,7 +677,9 @@ async def cmd_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             text=f"📩 <b>Message from Admin:</b>\n\n{text}",
             parse_mode=ParseMode.HTML,
         )
-        await update.message.reply_text(f"✅ Message delivered to <code>{target_id}</code>.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            f"✅ Message delivered to <code>{target_id}</code>.", parse_mode=ParseMode.HTML
+        )
     except Forbidden:
         await update.message.reply_text(
             f"❌ Cannot send: user <code>{target_id}</code> has blocked the bot.",
@@ -659,7 +692,9 @@ async def cmd_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @admin_only
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: <code>/broadcast &lt;message&gt;</code>", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            "Usage: <code>/broadcast &lt;message&gt;</code>", parse_mode=ParseMode.HTML
+        )
         return
 
     text       = " ".join(context.args)
@@ -742,7 +777,20 @@ async def job_check_subscriptions(bot: Bot) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_application() -> Application:
-    builder = ApplicationBuilder().token(BOT_TOKEN)
+    # Large timeouts so 1GB+ file downloads never time out mid-transfer
+    request = HTTPXRequest(
+        read_timeout=600,
+        write_timeout=600,
+        connect_timeout=30,
+        pool_timeout=30,
+    )
+
+    builder = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .get_updates_request(request)
+    )
 
     local_api_url = os.environ.get("LOCAL_BOT_API_URL")
     if local_api_url:
@@ -771,8 +819,8 @@ def build_application() -> Application:
         per_chat=True,
     )
 
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("start",      cmd_start))
+    app.add_handler(CommandHandler("status",     cmd_status))
     app.add_handler(upgrade_conv)
     app.add_handler(CommandHandler("stats",      cmd_stats))
     app.add_handler(CommandHandler("broadcast",  cmd_broadcast))
@@ -781,8 +829,8 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("setpremium", cmd_setpremium))
     app.add_handler(CommandHandler("depremium",  cmd_depremium))
     app.add_handler(CommandHandler("send",       cmd_send))
-    app.add_handler(CallbackQueryHandler(callback_approve, pattern=r"^approve_\d+$"))
-    app.add_handler(CallbackQueryHandler(callback_reject,  pattern=r"^reject_\d+$"))
+    app.add_handler(CallbackQueryHandler(callback_approve,        pattern=r"^approve_\d+$"))
+    app.add_handler(CallbackQueryHandler(callback_reject,         pattern=r"^reject_\d+$"))
     app.add_handler(CallbackQueryHandler(compress_video_callback, pattern=r"^video_(low|medium|high)$"))
     app.add_handler(MessageHandler(filters.PHOTO  & ~filters.COMMAND, handle_photo))
     app.add_handler(MessageHandler(filters.VIDEO  & ~filters.COMMAND, handle_video))
@@ -815,6 +863,10 @@ async def on_shutdown(app: Application) -> None:
         scheduler.shutdown(wait=False)
     logger.info("Bot shut down cleanly.")
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     application = build_application()
