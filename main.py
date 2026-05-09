@@ -438,7 +438,9 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
     tg_file = await context.bot.get_file(video_file_id)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        in_path  = Path(tmpdir) / "input.mp4"
+        # Preserve original extension so FFmpeg can detect the container format
+        orig_ext = Path(tg_file.file_path).suffix if tg_file.file_path else ".mp4"
+        in_path  = Path(tmpdir) / f"input{orig_ext}"
         out_path = Path(tmpdir) / "output.mp4"
 
         # Download — async, does not block other users
@@ -447,7 +449,11 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
         cmd = [
             "ffmpeg", "-y", "-i", str(in_path),
             "-vcodec", "libx264", "-crf", str(crf),
-            "-preset", "fast", "-acodec", "aac", "-b:a", "128k",
+            "-preset", "fast",
+            "-pix_fmt", "yuv420p",   # convert 10-bit (HEVC/HDR) to 8-bit for libx264
+            "-acodec", "aac", "-b:a", "128k",
+            "-map", "0:v:0",         # take only the first video stream
+            "-map", "0:a:0",         # take only the first audio stream (skip subtitles)
             str(out_path),
         ]
 
