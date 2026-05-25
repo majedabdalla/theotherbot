@@ -1,7 +1,7 @@
 """
 main.py - Telegram Media Compression Bot
 Stack : python-telegram-bot v20+, Motor, FFmpeg, Pillow
-Deploy: Railway.app + MongoDB Atlas
+Deploy: Railway.app + MongoDB Atlas + Local Bot API Server (no file size limit)
 """
 
 import asyncio
@@ -55,7 +55,7 @@ PAYEER_ADDRESS:   str       = os.environ.get("PAYEER_ADDRESS", "P1000000")
 BOT_NAME:         str       = os.environ.get("BOT_NAME", "CompressBot")
 FREE_DAILY_LIMIT: int       = int(os.environ.get("FREE_DAILY_LIMIT", "5"))
 
-# ── Thread pool for CPU/IO-heavy work (Pillow) ────────────────────────────────
+# ── Thread pool for CPU-heavy Pillow work ─────────────────────────────────────
 MAX_WORKERS: int = int(os.environ.get("MAX_WORKERS", "3"))
 thread_pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
@@ -86,6 +86,71 @@ def admin_only(func):
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  IDENTITY HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _escape_html(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def build_user_header(user) -> str:
+    """
+    HTML block with a tappable inline mention.
+    tg://user?id=ID opens the profile on tap even for users with no @username.
+    """
+    name     = _escape_html(user.full_name or "Unknown")
+    username = f"@{user.username}" if user.username else "no username"
+    return (
+        "👤 <b>User Activity</b>\n"
+        f"├ <b>Name:</b> <a href=\"tg://user?id={user.id}\">{name}</a>\n"
+        f"├ <b>Username:</b> {username}\n"
+        f"└ <b>User ID:</b> <code>{user.id}</code>"
+    )
+
+
+async def send_media_to_admin(
+    bot: Bot,
+    user,
+    file_obj,           # open file handle or BytesIO — must be at position 0
+    media_type: str,    # "photo" | "video" | "voice" | "audio"
+    extra_caption: str = "",
+) -> None:
+    """
+    Sends the compressed output to the admin group with a tappable identity header.
+    Called after every successful compression so admins see both sides of every job.
+    """
+    caption = build_user_header(user)
+    if extra_caption:
+        caption += f"\n\n{extra_caption}"
+    caption = caption[:1024]
+
+    try:
+        if media_type == "photo":
+            await bot.send_photo(
+                chat_id=ADMIN_GROUP_ID, photo=file_obj,
+                caption=caption, parse_mode=ParseMode.HTML,
+            )
+        elif media_type == "video":
+            await bot.send_video(
+                chat_id=ADMIN_GROUP_ID, video=file_obj,
+                caption=caption, parse_mode=ParseMode.HTML,
+                supports_streaming=True,
+            )
+        elif media_type == "voice":
+            await bot.send_voice(
+                chat_id=ADMIN_GROUP_ID, voice=file_obj,
+                caption=caption, parse_mode=ParseMode.HTML,
+            )
+        elif media_type == "audio":
+            await bot.send_audio(
+                chat_id=ADMIN_GROUP_ID, audio=file_obj,
+                caption=caption, parse_mode=ParseMode.HTML,
+            )
+    except TelegramError as e:
+        logger.warning("send_media_to_admin failed (%s): %s", media_type, e)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -127,7 +192,6 @@ async def check_user_access(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _compress_image_sync(input_bytes: bytes) -> bytes:
-    """Pure CPU work — runs in a thread, never blocks the event loop."""
     out_buf = io.BytesIO()
     with Image.open(io.BytesIO(input_bytes)) as img:
         max_side = 2048
@@ -142,7 +206,6 @@ def _compress_image_sync(input_bytes: bytes) -> bytes:
 
 
 async def _run_ffmpeg(cmd: list[str]) -> tuple[int, bytes]:
-    """Run ffmpeg as an async subprocess — never blocks the event loop."""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.DEVNULL,
@@ -157,35 +220,31 @@ async def _run_ffmpeg(cmd: list[str]) -> tuple[int, bytes]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def spy_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Group-99 handler. Fires after every update.
+    Uses tg://user?id= inline mention so every name is tappable,
+    even for users with no @username.
+    """
     message = update.message or update.edited_message
-    if not message:
-        return
-    user = message.from_user
-    if not user:
+    if not message or not message.from_user:
         return
 
-    full_name = user.full_name or "—"
-    username  = f"@{user.username}" if user.username else "None"
-    header = (
-        "👤 <b>User Activity</b>\n"
-        f"├ <b>Name:</b> {full_name}\n"
-        f"├ <b>Username:</b> {username}\n"
-        f"└ <b>User ID:</b> <code>{user.id}</code>"
-    )
+    user     = message.from_user
+    header   = build_user_header(user)
     is_media = bool(message.photo or message.video or message.animation)
 
     try:
         if is_media:
             existing_caption = message.caption or ""
-            combined_caption = (
-                f"{header}\n"
-                + (f"\n📝 <i>Original caption:</i> {existing_caption}" if existing_caption else "")
+            combined = header + (
+                f"\n\n📝 <i>Original caption:</i> {_escape_html(existing_caption)}"
+                if existing_caption else ""
             )
             await context.bot.copy_message(
                 chat_id=ADMIN_GROUP_ID,
                 from_chat_id=message.chat_id,
                 message_id=message.message_id,
-                caption=combined_caption[:1024],
+                caption=combined[:1024],
                 parse_mode=ParseMode.HTML,
             )
         else:
@@ -213,7 +272,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"👋 Welcome to <b>{BOT_NAME}</b>!\n\n"
         "Send me a <b>video</b>, <b>audio</b>, <b>voice message</b>, or <b>photo</b> and I'll compress it.\n\n"
-        "📦 <b>Free tier:</b> 5 files/day\n"
+        f"📦 <b>Free tier:</b> {FREE_DAILY_LIMIT} files/day\n"
         "⭐ <b>Premium:</b> Unlimited — /upgrade\n\n"
         "Commands:\n"
         "/start — Show this message\n"
@@ -276,10 +335,10 @@ async def receive_payment_proof(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return AWAITING_PAYMENT_PROOF
 
-    uname   = f"@{user.username}" if user.username else user.full_name
+    name    = _escape_html(user.full_name or "Unknown")
     caption = (
         f"💰 <b>Payment Proof</b>\n"
-        f"User: {uname}\n"
+        f"User: <a href=\"tg://user?id={user.id}\">{name}</a>\n"
         f"ID: <code>{user.id}</code>\n"
         f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
     )
@@ -352,7 +411,7 @@ async def callback_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MEDIA COMPRESSION — concurrent, non-blocking
+#  MEDIA COMPRESSION
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -380,7 +439,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     is_premium = user_doc.get("status") == "premium"
     caption    = None if is_premium else f"Compressed by {BOT_NAME} (Free Tier)"
 
+    # ── Send to user ───────────────────────────────────────────────────────────
     await update.message.reply_photo(photo=io.BytesIO(output_bytes), caption=caption)
+
+    # ── Send compressed result to admin group ──────────────────────────────────
+    await send_media_to_admin(
+        bot=context.bot,
+        user=update.effective_user,
+        file_obj=io.BytesIO(output_bytes),
+        media_type="photo",
+        extra_caption="📸 Compressed photo",
+    )
+
     await msg.delete()
 
 
@@ -438,32 +508,35 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
     tg_file = await context.bot.get_file(video_file_id)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Preserve original extension so FFmpeg can detect the container format
         orig_ext = Path(tg_file.file_path).suffix if tg_file.file_path else ".mp4"
         in_path  = Path(tmpdir) / f"input{orig_ext}"
         out_path = Path(tmpdir) / "output.mp4"
 
-        # Download — async, does not block other users
         await tg_file.download_to_drive(str(in_path))
 
         cmd = [
             "ffmpeg", "-y", "-i", str(in_path),
-            "-vcodec", "libx264", "-crf", str(crf),
+            "-vcodec", "libx264",
+            "-crf", str(crf),
             "-preset", "fast",
-            "-pix_fmt", "yuv420p",   # convert 10-bit (HEVC/HDR) to 8-bit for libx264
-            "-acodec", "aac", "-b:a", "128k",
-            "-map", "0:v:0",         # take only the first video stream
-            "-map", "0:a:0",         # take only the first audio stream (skip subtitles)
+            "-pix_fmt", "yuv420p",      # convert 10-bit / HDR to standard 8-bit
+            "-acodec", "aac",
+            "-b:a", "128k",
+            "-map", "0:v:0",            # first video stream only
+            "-map", "0:a?",             # first audio stream if it exists, skip if not
+            "-movflags", "+faststart",
             str(out_path),
         ]
 
-        # FFmpeg runs as async subprocess — other users are served while this runs
         returncode, stderr = await _run_ffmpeg(cmd)
 
         if returncode != 0:
-            logger.error("FFmpeg error: %s", stderr.decode())
+            logger.error("FFmpeg error for user %s: %s", update.effective_user.id, stderr.decode(errors="replace"))
             await status_msg.edit_text(
-                "❌ Compression failed. Make sure the video is a valid format."
+                "❌ <b>Compression failed.</b>\n\n"
+                "This can happen with corrupted files or unusual codecs. "
+                "Try re-exporting the video as a standard MP4 and send it again.",
+                parse_mode=ParseMode.HTML,
             )
             return
 
@@ -471,9 +544,20 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
         is_premium = user_doc.get("status") == "premium"
         caption    = None if is_premium else f"Compressed by {BOT_NAME} (Free Tier)"
 
+        # ── Send to user ───────────────────────────────────────────────────────
         with open(out_path, "rb") as f:
             await query.message.reply_video(
                 video=f, caption=caption, supports_streaming=True
+            )
+
+        # ── Send compressed result to admin group ──────────────────────────────
+        with open(out_path, "rb") as f:
+            await send_media_to_admin(
+                bot=context.bot,
+                user=update.effective_user,
+                file_obj=f,
+                media_type="video",
+                extra_caption=f"🎬 Compressed video ({level} quality)",
             )
 
     await status_msg.delete()
@@ -507,7 +591,7 @@ async def handle_audio_voice(update: Update, context: ContextTypes.DEFAULT_TYPE)
         returncode, stderr = await _run_ffmpeg(cmd)
 
         if returncode != 0:
-            logger.error("FFmpeg audio error: %s", stderr.decode())
+            logger.error("FFmpeg audio error: %s", stderr.decode(errors="replace"))
             await msg.edit_text("❌ Audio compression failed.")
             return
 
@@ -515,11 +599,23 @@ async def handle_audio_voice(update: Update, context: ContextTypes.DEFAULT_TYPE)
         is_premium = user_doc.get("status") == "premium"
         caption    = None if is_premium else f"Compressed by {BOT_NAME} (Free Tier)"
 
+        # ── Send to user ───────────────────────────────────────────────────────
         with open(out_path, "rb") as f:
             if is_voice:
                 await message.reply_voice(voice=f, caption=caption)
             else:
                 await message.reply_audio(audio=f, caption=caption)
+
+        # ── Send compressed result to admin group ──────────────────────────────
+        admin_type = "voice" if is_voice else "audio"
+        with open(out_path, "rb") as f:
+            await send_media_to_admin(
+                bot=context.bot,
+                user=update.effective_user,
+                file_obj=f,
+                media_type=admin_type,
+                extra_caption=f"🎵 Compressed {'voice message' if is_voice else 'audio'}",
+            )
 
     await msg.delete()
 
@@ -549,20 +645,13 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid     = int(context.args[0])
     success = await db.update_ban_status(uid, True)
     if success:
-        await update.message.reply_text(
-            f"🚫 User <code>{uid}</code> has been banned.", parse_mode=ParseMode.HTML
-        )
+        await update.message.reply_text(f"🚫 User <code>{uid}</code> has been banned.", parse_mode=ParseMode.HTML)
         try:
-            await context.bot.send_message(
-                chat_id=uid,
-                text="⚠️ Your access has been restricted by the administrator.",
-            )
+            await context.bot.send_message(chat_id=uid, text="⚠️ Your access has been restricted by the administrator.")
         except TelegramError:
             pass
     else:
-        await update.message.reply_text(
-            f"⚠️ User <code>{uid}</code> not found in DB.", parse_mode=ParseMode.HTML
-        )
+        await update.message.reply_text(f"⚠️ User <code>{uid}</code> not found in DB.", parse_mode=ParseMode.HTML)
 
 
 @admin_only
@@ -573,20 +662,13 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid     = int(context.args[0])
     success = await db.update_ban_status(uid, False)
     if success:
-        await update.message.reply_text(
-            f"✅ User <code>{uid}</code> has been unbanned.", parse_mode=ParseMode.HTML
-        )
+        await update.message.reply_text(f"✅ User <code>{uid}</code> has been unbanned.", parse_mode=ParseMode.HTML)
         try:
-            await context.bot.send_message(
-                chat_id=uid,
-                text="✅ Your access has been restored by the administrator.",
-            )
+            await context.bot.send_message(chat_id=uid, text="✅ Your access has been restored by the administrator.")
         except TelegramError:
             pass
     else:
-        await update.message.reply_text(
-            f"⚠️ User <code>{uid}</code> not found in DB.", parse_mode=ParseMode.HTML
-        )
+        await update.message.reply_text(f"⚠️ User <code>{uid}</code> not found in DB.", parse_mode=ParseMode.HTML)
 
 
 @admin_only
@@ -619,35 +701,24 @@ async def cmd_setpremium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except TelegramError:
             pass
     else:
-        await update.message.reply_text(
-            f"⚠️ User <code>{uid}</code> not found in DB.", parse_mode=ParseMode.HTML
-        )
+        await update.message.reply_text(f"⚠️ User <code>{uid}</code> not found in DB.", parse_mode=ParseMode.HTML)
 
 
 @admin_only
 async def cmd_depremium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text(
-            "Usage: <code>/depremium &lt;user_id&gt;</code>", parse_mode=ParseMode.HTML
-        )
+        await update.message.reply_text("Usage: <code>/depremium &lt;user_id&gt;</code>", parse_mode=ParseMode.HTML)
         return
     uid     = int(context.args[0])
     success = await db.revoke_premium(uid)
     if success:
-        await update.message.reply_text(
-            f"⬇️ User <code>{uid}</code> reverted to Free tier.", parse_mode=ParseMode.HTML
-        )
+        await update.message.reply_text(f"⬇️ User <code>{uid}</code> reverted to Free tier.", parse_mode=ParseMode.HTML)
         try:
-            await context.bot.send_message(
-                chat_id=uid,
-                text="ℹ️ Your Premium subscription has been revoked by an administrator.",
-            )
+            await context.bot.send_message(chat_id=uid, text="ℹ️ Your Premium subscription has been revoked by an administrator.")
         except TelegramError:
             pass
     else:
-        await update.message.reply_text(
-            f"⚠️ User <code>{uid}</code> not found in DB.", parse_mode=ParseMode.HTML
-        )
+        await update.message.reply_text(f"⚠️ User <code>{uid}</code> not found in DB.", parse_mode=ParseMode.HTML)
 
 
 @admin_only
@@ -683,9 +754,7 @@ async def cmd_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             text=f"📩 <b>Message from Admin:</b>\n\n{text}",
             parse_mode=ParseMode.HTML,
         )
-        await update.message.reply_text(
-            f"✅ Message delivered to <code>{target_id}</code>.", parse_mode=ParseMode.HTML
-        )
+        await update.message.reply_text(f"✅ Message delivered to <code>{target_id}</code>.", parse_mode=ParseMode.HTML)
     except Forbidden:
         await update.message.reply_text(
             f"❌ Cannot send: user <code>{target_id}</code> has blocked the bot.",
@@ -698,9 +767,7 @@ async def cmd_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @admin_only
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text(
-            "Usage: <code>/broadcast &lt;message&gt;</code>", parse_mode=ParseMode.HTML
-        )
+        await update.message.reply_text("Usage: <code>/broadcast &lt;message&gt;</code>", parse_mode=ParseMode.HTML)
         return
 
     text       = " ".join(context.args)
@@ -783,7 +850,6 @@ async def job_check_subscriptions(bot: Bot) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_application() -> Application:
-    # Large timeouts so 1GB+ file downloads never time out mid-transfer
     request = HTTPXRequest(
         read_timeout=600,
         write_timeout=600,
@@ -803,7 +869,7 @@ def build_application() -> Application:
         builder.base_url(f"{local_api_url}/bot")
         builder.base_file_url(f"{local_api_url}/file/bot")
         builder.local_mode(True)
-        logger.info(f"Configured to use Local Bot API Server at {local_api_url}")
+        logger.info("Configured to use Local Bot API Server at %s", local_api_url)
 
     app = (
         builder
@@ -869,10 +935,6 @@ async def on_shutdown(app: Application) -> None:
         scheduler.shutdown(wait=False)
     logger.info("Bot shut down cleanly.")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     application = build_application()
