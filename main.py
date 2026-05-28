@@ -631,28 +631,9 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
             err_text = stderr.decode(errors="replace")
             logger.error("FFmpeg error for user %s:\n%s", user.id, err_text)
 
-            # Skip ffmpeg version/build block, find the real error
-            lines = err_text.splitlines()
-            # The build block ends when we hit a line that doesn't start with
-            # spaces or known build keywords — typically after "configuration:"
-            start_idx = 0
-            for i, line in enumerate(lines):
-                if line.startswith("Input #") or line.startswith("Output #") or (
-                    any(k in line.lower() for k in ("error", "invalid", "failed", "could not", "not supported"))
-                    and "configuration" not in line.lower()
-                ):
-                    start_idx = i
-                    break
-
-            remaining = lines[start_idx:]
-            error_lines = [
-                line for line in remaining
-                if any(k in line.lower() for k in (
-                    "error", "invalid", "unable", "no such",
-                    "failed", "could not", "not supported", "conversion failed"
-                ))
-            ]
-            detailed_err = "\n".join(error_lines[:8]) if error_lines else "\n".join(remaining[:15])
+            # Real FFmpeg errors are always at the end — take the last 20 non-empty lines
+            lines = [l for l in err_text.splitlines() if l.strip()]
+            detailed_err = "\n".join(lines[-20:])
 
             # Send detailed error to admin group, replying to the original file message
             try:
