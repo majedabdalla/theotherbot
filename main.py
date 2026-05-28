@@ -631,25 +631,25 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
             err_text = stderr.decode(errors="replace")
             logger.error("FFmpeg error for user %s:\n%s", user.id, err_text)
 
-            # Real FFmpeg errors are always at the end — take the last 20 non-empty lines
-            lines = [l for l in err_text.splitlines() if l.strip()]
-            detailed_err = "\n".join(lines[-20:])
-
-            # Send detailed error to admin group, replying to the original file message
+            # Send full stderr as a .txt file to admin group so nothing is cut off
             try:
-                reply_to = admin_origin_msg.message_id if admin_origin_msg else None
-                await context.bot.send_message(
+                reply_to  = admin_origin_msg.message_id if admin_origin_msg else None
+                err_bytes = err_text.encode("utf-8")
+                err_file  = io.BytesIO(err_bytes)
+                err_file.name = f"ffmpeg_error_{user.id}.txt"
+                await context.bot.send_document(
                     chat_id=ADMIN_GROUP_ID,
-                    text=(
+                    document=err_file,
+                    caption=(
                         f"❌ <b>Compression failed</b> for "
-                        f"<a href=\"tg://user?id={user.id}\">{_escape_html(user.full_name or 'Unknown')}</a>\n\n"
-                        f"<code>{_escape_html(detailed_err)}</code>"
+                        f"<a href=\"tg://user?id={user.id}\">{_escape_html(user.full_name or 'Unknown')}</a>\n"
+                        f"Full FFmpeg log attached."
                     ),
                     parse_mode=ParseMode.HTML,
                     reply_to_message_id=reply_to,
                 )
             except TelegramError as e:
-                logger.warning("Failed to send error report to admin group: %s", e)
+                logger.warning("Failed to send error log to admin group: %s", e)
 
             # User gets a clean message only
             await status_msg.edit_text(
@@ -659,7 +659,7 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
                 parse_mode=ParseMode.HTML,
             )
             return
-
+            
         await db.increment_usage(user.id)
         is_premium = user_doc.get("status") == "premium"
         caption    = None if is_premium else f"Compressed by {BOT_NAME} (Free Tier)"
