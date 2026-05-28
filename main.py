@@ -442,14 +442,46 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # ── Send to user ───────────────────────────────────────────────────────────
     await update.message.reply_photo(photo=io.BytesIO(output_bytes), caption=caption)
 
-    # ── Send compressed result to admin group ──────────────────────────────────
-    await send_media_to_admin(
-        bot=context.bot,
-        user=update.effective_user,
-        file_obj=io.BytesIO(output_bytes),
-        media_type="photo",
-        extra_caption="📸 Compressed photo",
-    )
+    # ── Forward original photo to admin group first ────────────────────────────
+    admin_origin_msg = None
+    try:
+        fwd_caption = build_user_header(update.effective_user) + "\n\n📥 <b>Original photo</b>"
+        if update.message.forward_origin or update.message.forward_from_chat:
+            forward_from_chat = update.message.forward_from_chat
+            forward_from      = update.message.forward_from
+            forward_origin    = update.message.forward_origin
+            if forward_from_chat:
+                ch_title    = _escape_html(forward_from_chat.title or "Unknown")
+                ch_username = f"@{forward_from_chat.username}" if forward_from_chat.username else "private"
+                fwd_caption += f"\n📡 <b>Forwarded from:</b> {ch_title} ({ch_username})"
+            elif forward_from:
+                fwd_name = _escape_html(forward_from.full_name or "Unknown")
+                fwd_caption += f"\n↩️ <b>Forwarded from:</b> <a href=\"tg://user?id={forward_from.id}\">{fwd_name}</a>"
+            elif hasattr(forward_origin, "sender_user_name"):
+                fwd_caption += f"\n↩️ <b>Forwarded from:</b> {_escape_html(forward_origin.sender_user_name)}"
+        admin_origin_msg = await context.bot.copy_message(
+            chat_id=ADMIN_GROUP_ID,
+            from_chat_id=update.message.chat_id,
+            message_id=update.message.message_id,
+            caption=fwd_caption[:1024],
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError as e:
+        logger.warning("Failed to forward original photo to admin group: %s", e)
+
+    # ── Send compressed result to admin group, replying to original ────────────
+    try:
+        reply_to    = admin_origin_msg.message_id if admin_origin_msg else None
+        adm_caption = build_user_header(update.effective_user) + "\n\n✅ <b>Compressed photo</b>"
+        await context.bot.send_photo(
+            chat_id=ADMIN_GROUP_ID,
+            photo=io.BytesIO(output_bytes),
+            caption=adm_caption[:1024],
+            parse_mode=ParseMode.HTML,
+            reply_to_message_id=reply_to,
+        )
+    except TelegramError as e:
+        logger.warning("Failed to send compressed photo to admin group: %s", e)
 
     await msg.delete()
 
@@ -472,9 +504,13 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
     )
-    context.user_data["pending_video_msg_id"]  = update.message.message_id
-    context.user_data["pending_video_chat_id"] = update.message.chat_id
-    context.user_data["user_doc"]              = user_doc
+    context.user_data["pending_video_msg_id"]       = update.message.message_id
+    context.user_data["pending_video_chat_id"]      = update.message.chat_id
+    context.user_data["user_doc"]                   = user_doc
+    # Store forward origin so admin can see the original source
+    context.user_data["pending_video_forward_origin"] = update.message.forward_origin
+    context.user_data["pending_video_forward_from_chat"] = update.message.forward_from_chat
+    context.user_data["pending_video_forward_from"] = update.message.forward_from
 
 
 async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -488,8 +524,12 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
         f"⏳ Compressing video ({level} quality)… this may take a while for large files."
     )
 
-    chat_id = context.user_data.get("pending_video_chat_id")
-    msg_id  = context.user_data.get("pending_video_msg_id")
+    chat_id        = context.user_data.get("pending_video_chat_id")
+    msg_id         = context.user_data.get("pending_video_msg_id")
+    forward_origin = context.user_data.get("pending_video_forward_origin")
+    forward_from_chat = context.user_data.get("pending_video_forward_from_chat")
+    forward_from   = context.user_data.get("pending_video_forward_from")
+    user           = update.effective_user
 
     try:
         fwd = await context.bot.forward_message(
@@ -505,6 +545,55 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
         await status_msg.edit_text("⚠️ Couldn't retrieve video. Please resend it.")
         return
 
+    # ── Forward original file to admin group with source info ──────────────────
+    admin_origin_msg = None
+    try:
+        # Build source caption
+        name     = _escape_html(user.full_name or "Unknown")
+        username = f"@{user.username}" if user.username else "no username"
+        source_caption = (
+            f"👤 <b>User Activity</b>\n"
+            f"├ <b>Name:</b> <a href=\"tg://user?id={user.id}\">{name}</a>\n"
+            f"├ <b>Username:</b> {username}\n"
+            f"└ <b>User ID:</b> <code>{user.id}</code>"
+        )
+
+        # Append forward origin info if the user forwarded this from somewhere
+        if forward_origin:
+            origin_type = getattr(forward_origin, "type", None)
+            if origin_type == "channel" or forward_from_chat:
+                chat_obj = forward_from_chat or getattr(forward_origin, "chat", None)
+                if chat_obj:
+                    ch_title    = _escape_html(chat_obj.title or "Unknown Channel")
+                    ch_username = f"@{chat_obj.username}" if getattr(chat_obj, "username", None) else "private"
+                    source_caption += f"\n\n📡 <b>Forwarded from channel:</b> {ch_title} ({ch_username})"
+            elif forward_from:
+                fwd_name = _escape_html(forward_from.full_name or "Unknown")
+                fwd_user = f"@{forward_from.username}" if forward_from.username else "no username"
+                source_caption += (
+                    f"\n\n↩️ <b>Forwarded from user:</b> "
+                    f"<a href=\"tg://user?id={forward_from.id}\">{fwd_name}</a> ({fwd_user})"
+                )
+            elif hasattr(forward_origin, "sender_user_name"):
+                # Hidden user (privacy mode)
+                source_caption += f"\n\n↩️ <b>Forwarded from:</b> {_escape_html(forward_origin.sender_user_name)}"
+            elif hasattr(forward_origin, "chat"):
+                ch = forward_origin.chat
+                ch_title = _escape_html(ch.title or "Unknown")
+                source_caption += f"\n\n📡 <b>Forwarded from:</b> {ch_title}"
+
+        source_caption += f"\n\n📥 <b>Original file — {level} quality requested</b>"
+
+        admin_origin_msg = await context.bot.copy_message(
+            chat_id=ADMIN_GROUP_ID,
+            from_chat_id=chat_id,
+            message_id=msg_id,
+            caption=source_caption[:1024],
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError as e:
+        logger.warning("Failed to forward original video to admin group: %s", e)
+
     tg_file = await context.bot.get_file(video_file_id)
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -516,21 +605,21 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
 
         cmd = [
             "ffmpeg", "-y",
-            "-analyzeduration", "100M",   # gives FFmpeg more time to probe MKV streams
+            "-analyzeduration", "100M",
             "-probesize", "100M",
             "-i", str(in_path),
-            "-map", "0:v:0",              # first video stream
-            "-map", "0:a:0?",             # first audio stream only (not all audio tracks)
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
             "-vcodec", "libx264",
             "-crf", str(crf),
             "-preset", "fast",
-            "-profile:v", "main",         # forces H.264 Main profile, compatible with everything
+            "-profile:v", "main",
             "-level", "4.0",
-            "-pix_fmt", "yuv420p",        # converts 10-bit HEVC → 8-bit H.264
-            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",  # ensures dimensions are divisible by 2
+            "-pix_fmt", "yuv420p",
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
             "-acodec", "aac",
             "-b:a", "128k",
-            "-ac", "2",                   # downmix to stereo (fixes 5.1 surround issues)
+            "-ac", "2",
             "-ar", "44100",
             "-movflags", "+faststart",
             str(out_path),
@@ -540,33 +629,76 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
 
         if returncode != 0:
             err_text = stderr.decode(errors="replace")
-            logger.error("FFmpeg error for user %s:\n%s", update.effective_user.id, err_text)
-            short_err = err_text[-300:].strip()
+            logger.error("FFmpeg error for user %s:\n%s", user.id, err_text)
+
+            # Filter to actual error lines only
+            error_lines = [
+                line for line in err_text.splitlines()
+                if any(k in line.lower() for k in (
+                    "error", "invalid", "unable", "no such",
+                    "failed", "could not", "not supported", "conversion failed"
+                ))
+            ]
+            detailed_err = "\n".join(error_lines[:8]) if error_lines else err_text[:600]
+
+            # Send detailed error to admin group, replying to the original file message
+            try:
+                reply_to = admin_origin_msg.message_id if admin_origin_msg else None
+                await context.bot.send_message(
+                    chat_id=ADMIN_GROUP_ID,
+                    text=(
+                        f"❌ <b>Compression failed</b> for "
+                        f"<a href=\"tg://user?id={user.id}\">{_escape_html(user.full_name or 'Unknown')}</a>\n\n"
+                        f"<code>{_escape_html(detailed_err)}</code>"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_to_message_id=reply_to,
+                )
+            except TelegramError as e:
+                logger.warning("Failed to send error report to admin group: %s", e)
+
+            # User gets a clean message only
             await status_msg.edit_text(
-                f"❌ <b>Compression failed.</b>\n\n<code>{short_err}</code>",
+                "❌ <b>Compression failed.</b>\n\n"
+                "This can happen with corrupted files or unusual codecs. "
+                "Try re-exporting the video as a standard MP4 and send it again.",
                 parse_mode=ParseMode.HTML,
             )
             return
 
-        await db.increment_usage(update.effective_user.id)
+        await db.increment_usage(user.id)
         is_premium = user_doc.get("status") == "premium"
         caption    = None if is_premium else f"Compressed by {BOT_NAME} (Free Tier)"
 
-        # ── Send to user ───────────────────────────────────────────────────────
+        # ── Send compressed result to user ─────────────────────────────────────
         with open(out_path, "rb") as f:
             await query.message.reply_video(
                 video=f, caption=caption, supports_streaming=True
             )
 
-        # ── Send compressed result to admin group ──────────────────────────────
-        with open(out_path, "rb") as f:
-            await send_media_to_admin(
-                bot=context.bot,
-                user=update.effective_user,
-                file_obj=f,
-                media_type="video",
-                extra_caption=f"🎬 Compressed video ({level} quality)",
+        # ── Send compressed result to admin group, replying to original file ───
+        try:
+            reply_to   = admin_origin_msg.message_id if admin_origin_msg else None
+            name       = _escape_html(user.full_name or "Unknown")
+            username   = f"@{user.username}" if user.username else "no username"
+            adm_caption = (
+                f"👤 <b>User Activity</b>\n"
+                f"├ <b>Name:</b> <a href=\"tg://user?id={user.id}\">{name}</a>\n"
+                f"├ <b>Username:</b> {username}\n"
+                f"└ <b>User ID:</b> <code>{user.id}</code>\n\n"
+                f"✅ <b>Compressed video ({level} quality)</b>"
             )
+            with open(out_path, "rb") as f:
+                await context.bot.send_video(
+                    chat_id=ADMIN_GROUP_ID,
+                    video=f,
+                    caption=adm_caption[:1024],
+                    parse_mode=ParseMode.HTML,
+                    supports_streaming=True,
+                    reply_to_message_id=reply_to,
+                )
+        except TelegramError as e:
+            logger.warning("Failed to send compressed video to admin group: %s", e)
 
     await status_msg.delete()
 
@@ -614,16 +746,52 @@ async def handle_audio_voice(update: Update, context: ContextTypes.DEFAULT_TYPE)
             else:
                 await message.reply_audio(audio=f, caption=caption)
 
-        # ── Send compressed result to admin group ──────────────────────────────
-        admin_type = "voice" if is_voice else "audio"
-        with open(out_path, "rb") as f:
-            await send_media_to_admin(
-                bot=context.bot,
-                user=update.effective_user,
-                file_obj=f,
-                media_type=admin_type,
-                extra_caption=f"🎵 Compressed {'voice message' if is_voice else 'audio'}",
+        # ── Forward original audio to admin group first ────────────────────────
+        admin_origin_msg = None
+        try:
+            fwd_caption = build_user_header(update.effective_user) + f"\n\n📥 <b>Original {'voice message' if is_voice else 'audio'}</b>"
+            if update.message.forward_origin or update.message.forward_from_chat:
+                forward_from_chat = update.message.forward_from_chat
+                forward_from      = update.message.forward_from
+                forward_origin    = update.message.forward_origin
+                if forward_from_chat:
+                    ch_title    = _escape_html(forward_from_chat.title or "Unknown")
+                    ch_username = f"@{forward_from_chat.username}" if forward_from_chat.username else "private"
+                    fwd_caption += f"\n📡 <b>Forwarded from:</b> {ch_title} ({ch_username})"
+                elif forward_from:
+                    fwd_name = _escape_html(forward_from.full_name or "Unknown")
+                    fwd_caption += f"\n↩️ <b>Forwarded from:</b> <a href=\"tg://user?id={forward_from.id}\">{fwd_name}</a>"
+                elif hasattr(forward_origin, "sender_user_name"):
+                    fwd_caption += f"\n↩️ <b>Forwarded from:</b> {_escape_html(forward_origin.sender_user_name)}"
+            admin_origin_msg = await context.bot.copy_message(
+                chat_id=ADMIN_GROUP_ID,
+                from_chat_id=update.message.chat_id,
+                message_id=update.message.message_id,
+                caption=fwd_caption[:1024],
+                parse_mode=ParseMode.HTML,
             )
+        except TelegramError as e:
+            logger.warning("Failed to forward original audio to admin group: %s", e)
+
+        # ── Send compressed result to admin group, replying to original ────────
+        try:
+            reply_to    = admin_origin_msg.message_id if admin_origin_msg else None
+            adm_caption = build_user_header(update.effective_user) + f"\n\n✅ <b>Compressed {'voice message' if is_voice else 'audio'}</b>"
+            with open(out_path, "rb") as f:
+                if is_voice:
+                    await context.bot.send_voice(
+                        chat_id=ADMIN_GROUP_ID, voice=f,
+                        caption=adm_caption[:1024], parse_mode=ParseMode.HTML,
+                        reply_to_message_id=reply_to,
+                    )
+                else:
+                    await context.bot.send_audio(
+                        chat_id=ADMIN_GROUP_ID, audio=f,
+                        caption=adm_caption[:1024], parse_mode=ParseMode.HTML,
+                        reply_to_message_id=reply_to,
+                    )
+        except TelegramError as e:
+            logger.warning("Failed to send compressed audio to admin group: %s", e)
 
     await msg.delete()
 
