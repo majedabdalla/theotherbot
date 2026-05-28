@@ -515,15 +515,23 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
         await tg_file.download_to_drive(str(in_path))
 
         cmd = [
-            "ffmpeg", "-y", "-i", str(in_path),
+            "ffmpeg", "-y",
+            "-analyzeduration", "100M",   # gives FFmpeg more time to probe MKV streams
+            "-probesize", "100M",
+            "-i", str(in_path),
+            "-map", "0:v:0",              # first video stream
+            "-map", "0:a:0?",             # first audio stream only (not all audio tracks)
             "-vcodec", "libx264",
             "-crf", str(crf),
             "-preset", "fast",
-            "-pix_fmt", "yuv420p",      # convert 10-bit / HDR to standard 8-bit
+            "-profile:v", "main",         # forces H.264 Main profile, compatible with everything
+            "-level", "4.0",
+            "-pix_fmt", "yuv420p",        # converts 10-bit HEVC → 8-bit H.264
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",  # ensures dimensions are divisible by 2
             "-acodec", "aac",
             "-b:a", "128k",
-            "-map", "0:v:0",            # first video stream only
-            "-map", "0:a?",             # first audio stream if it exists, skip if not
+            "-ac", "2",                   # downmix to stereo (fixes 5.1 surround issues)
+            "-ar", "44100",
             "-movflags", "+faststart",
             str(out_path),
         ]
@@ -531,11 +539,11 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
         returncode, stderr = await _run_ffmpeg(cmd)
 
         if returncode != 0:
-            logger.error("FFmpeg error for user %s: %s", update.effective_user.id, stderr.decode(errors="replace"))
+            err_text = stderr.decode(errors="replace")
+            logger.error("FFmpeg error for user %s:\n%s", update.effective_user.id, err_text)
+            short_err = err_text[-300:].strip()
             await status_msg.edit_text(
-                "❌ <b>Compression failed.</b>\n\n"
-                "This can happen with corrupted files or unusual codecs. "
-                "Try re-exporting the video as a standard MP4 and send it again.",
+                f"❌ <b>Compression failed.</b>\n\n<code>{short_err}</code>",
                 parse_mode=ParseMode.HTML,
             )
             return
