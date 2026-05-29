@@ -524,13 +524,14 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
         f"⏳ Compressing video ({level} quality)… this may take a while for large files."
     )
 
-    chat_id        = context.user_data.get("pending_video_chat_id")
-    msg_id         = context.user_data.get("pending_video_msg_id")
-    forward_origin = context.user_data.get("pending_video_forward_origin")
+    chat_id           = context.user_data.get("pending_video_chat_id")
+    msg_id            = context.user_data.get("pending_video_msg_id")
+    forward_origin    = context.user_data.get("pending_video_forward_origin")
     forward_from_chat = context.user_data.get("pending_video_forward_from_chat")
-    forward_from   = context.user_data.get("pending_video_forward_from")
-    user           = update.effective_user
+    forward_from      = context.user_data.get("pending_video_forward_from")
+    user              = update.effective_user
 
+    # ── Retrieve the video file_id by forwarding then deleting ────────────────
     try:
         fwd = await context.bot.forward_message(
             chat_id=update.effective_chat.id,
@@ -545,10 +546,9 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
         await status_msg.edit_text("⚠️ Couldn't retrieve video. Please resend it.")
         return
 
-    # ── Forward original file to admin group with source info ──────────────────
+    # ── Forward original file to admin group with source info ─────────────────
     admin_origin_msg = None
     try:
-        # Build source caption
         name     = _escape_html(user.full_name or "Unknown")
         username = f"@{user.username}" if user.username else "no username"
         source_caption = (
@@ -557,8 +557,6 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
             f"├ <b>Username:</b> {username}\n"
             f"└ <b>User ID:</b> <code>{user.id}</code>"
         )
-
-        # Append forward origin info if the user forwarded this from somewhere
         if forward_origin:
             origin_type = getattr(forward_origin, "type", None)
             if origin_type == "channel" or forward_from_chat:
@@ -575,15 +573,11 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
                     f"<a href=\"tg://user?id={forward_from.id}\">{fwd_name}</a> ({fwd_user})"
                 )
             elif hasattr(forward_origin, "sender_user_name"):
-                # Hidden user (privacy mode)
                 source_caption += f"\n\n↩️ <b>Forwarded from:</b> {_escape_html(forward_origin.sender_user_name)}"
             elif hasattr(forward_origin, "chat"):
                 ch = forward_origin.chat
-                ch_title = _escape_html(ch.title or "Unknown")
-                source_caption += f"\n\n📡 <b>Forwarded from:</b> {ch_title}"
-
+                source_caption += f"\n\n📡 <b>Forwarded from:</b> {_escape_html(ch.title or 'Unknown')}"
         source_caption += f"\n\n📥 <b>Original file — {level} quality requested</b>"
-
         admin_origin_msg = await context.bot.copy_message(
             chat_id=ADMIN_GROUP_ID,
             from_chat_id=chat_id,
@@ -594,126 +588,118 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
     except TelegramError as e:
         logger.warning("Failed to forward original video to admin group: %s", e)
 
-    tg_file = await context.bot.get_file(video_file_id)
-
+    # ── Compression ───────────────────────────────────────────────────────────
     try:
-      with tempfile.TemporaryDirectory() as tmpdir:
-        orig_ext = Path(tg_file.file_path).suffix if tg_file.file_path else ".mp4"
-        in_path  = Path(tmpdir) / f"input{orig_ext}"
-        out_path = Path(tmpdir) / "output.mp4"
+        tg_file = await context.bot.get_file(video_file_id)
 
-        await tg_file.download_to_drive(str(in_path))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            orig_ext = Path(tg_file.file_path).suffix if tg_file.file_path else ".mp4"
+            in_path  = Path(tmpdir) / f"input{orig_ext}"
+            out_path = Path(tmpdir) / "output.mp4"
 
-        # Probe for audio stream before building command
-        probe_proc = await asyncio.create_subprocess_exec(
-            "ffprobe", "-v", "error",
-            "-select_streams", "a:0",
-            "-show_entries", "stream=codec_type",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(in_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        probe_out, _ = await probe_proc.communicate()
-        has_audio = probe_out.strip() == b"audio"
+            await tg_file.download_to_drive(str(in_path))
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(in_path),
-            "-map", "0:v:0",
-            "-vcodec", "libx264",
-            "-crf", str(crf),
-            "-preset", "fast",
-            "-profile:v", "main",
-            "-level", "4.0",
-            "-pix_fmt", "yuv420p",
-            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            "-threads", "2",
-            "-x264opts", "rc-lookahead=20:ref=1:threads=2",
-            "-movflags", "+faststart",
-        ]
+            # Probe for audio stream
+            probe_proc = await asyncio.create_subprocess_exec(
+                "ffprobe", "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=codec_type",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(in_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            probe_out, _ = await probe_proc.communicate()
+            has_audio = probe_out.strip() == b"audio"
 
-        if has_audio:
-            cmd += [
-                "-map", "0:a:0",
-                "-acodec", "aac",
-                "-b:a", "128k",
-                "-ac", "2",
-                "-ar", "44100",
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", str(in_path),
+                "-map", "0:v:0",
+                "-vcodec", "libx264",
+                "-crf", str(crf),
+                "-preset", "fast",
+                "-profile:v", "main",
+                "-level", "4.0",
+                "-pix_fmt", "yuv420p",
+                "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                "-threads", "2",
+                "-x264opts", "rc-lookahead=20:ref=1:threads=2",
+                "-movflags", "+faststart",
             ]
+            if has_audio:
+                cmd += [
+                    "-map", "0:a:0",
+                    "-acodec", "aac",
+                    "-b:a", "128k",
+                    "-ac", "2",
+                    "-ar", "44100",
+                ]
+            cmd.append(str(out_path))
 
-        cmd.append(str(out_path))
-        
-        returncode, stderr = await _run_ffmpeg(cmd)
+            returncode, stderr = await _run_ffmpeg(cmd)
 
-        if returncode != 0:
-            err_text = stderr.decode(errors="replace")
-            logger.error("FFmpeg error for user %s:\n%s", user.id, err_text)
-
-            # Send full stderr as a .txt file to admin group so nothing is cut off
-            try:
-                reply_to  = admin_origin_msg.message_id if admin_origin_msg else None
-                err_bytes = err_text.encode("utf-8")
-                err_file  = io.BytesIO(err_bytes)
-                err_file.name = f"ffmpeg_error_{user.id}.txt"
-                await context.bot.send_document(
-                    chat_id=ADMIN_GROUP_ID,
-                    document=err_file,
-                    caption=(
-                        f"❌ <b>Compression failed</b> for "
-                        f"<a href=\"tg://user?id={user.id}\">{_escape_html(user.full_name or 'Unknown')}</a>\n"
-                        f"Full FFmpeg log attached."
-                    ),
+            if returncode != 0:
+                err_text = stderr.decode(errors="replace")
+                logger.error("FFmpeg exit code %d for user %s:\n%s", returncode, user.id, err_text)
+                try:
+                    reply_to = admin_origin_msg.message_id if admin_origin_msg else None
+                    err_file = io.BytesIO(err_text.encode("utf-8"))
+                    err_file.name = f"ffmpeg_error_{user.id}.txt"
+                    await context.bot.send_document(
+                        chat_id=ADMIN_GROUP_ID,
+                        document=err_file,
+                        caption=(
+                            f"❌ <b>Compression failed</b> for "
+                            f"<a href=\"tg://user?id={user.id}\">{_escape_html(user.full_name or 'Unknown')}</a>\n"
+                            f"Exit code: <code>{returncode}</code> — full log attached."
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_to_message_id=reply_to,
+                    )
+                except TelegramError as e:
+                    logger.warning("Failed to send error log to admin group: %s", e)
+                await status_msg.edit_text(
+                    "❌ <b>Compression failed.</b>\n\n"
+                    "This can happen with corrupted files or unusual codecs. "
+                    "Try re-exporting the video as a standard MP4 and send it again.",
                     parse_mode=ParseMode.HTML,
-                    reply_to_message_id=reply_to,
                 )
-            except TelegramError as e:
-                logger.warning("Failed to send error log to admin group: %s", e)
+                return
 
-            # User gets a clean message only
-            await status_msg.edit_text(
-                "❌ <b>Compression failed.</b>\n\n"
-                "This can happen with corrupted files or unusual codecs. "
-                "Try re-exporting the video as a standard MP4 and send it again.",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-            
-        await db.increment_usage(user.id)
-        is_premium = user_doc.get("status") == "premium"
-        caption    = None if is_premium else f"Compressed by {BOT_NAME} (Free Tier)"
+            await db.increment_usage(user.id)
+            is_premium = user_doc.get("status") == "premium"
+            caption    = None if is_premium else f"Compressed by {BOT_NAME} (Free Tier)"
 
-        # ── Send compressed result to user ─────────────────────────────────────
-        with open(out_path, "rb") as f:
-            await query.message.reply_video(
-                video=f, caption=caption, supports_streaming=True
-            )
-
-        # ── Send compressed result to admin group, replying to original file ───
-        try:
-            reply_to   = admin_origin_msg.message_id if admin_origin_msg else None
-            name       = _escape_html(user.full_name or "Unknown")
-            username   = f"@{user.username}" if user.username else "no username"
-            adm_caption = (
-                f"👤 <b>User Activity</b>\n"
-                f"├ <b>Name:</b> <a href=\"tg://user?id={user.id}\">{name}</a>\n"
-                f"├ <b>Username:</b> {username}\n"
-                f"└ <b>User ID:</b> <code>{user.id}</code>\n\n"
-                f"✅ <b>Compressed video ({level} quality)</b>"
-            )
+            # Send to user
             with open(out_path, "rb") as f:
-                await context.bot.send_video(
-                    chat_id=ADMIN_GROUP_ID,
-                    video=f,
-                    caption=adm_caption[:1024],
-                    parse_mode=ParseMode.HTML,
-                    supports_streaming=True,
-                    reply_to_message_id=reply_to,
+                await query.message.reply_video(
+                    video=f, caption=caption, supports_streaming=True
                 )
-        except TelegramError as e:
-            logger.warning("Failed to send compressed video to admin group: %s", e)
 
-    await status_msg.delete()
+            # Send compressed result to admin group replying to original
+            try:
+                reply_to    = admin_origin_msg.message_id if admin_origin_msg else None
+                adm_caption = (
+                    f"👤 <b>User Activity</b>\n"
+                    f"├ <b>Name:</b> <a href=\"tg://user?id={user.id}\">{_escape_html(user.full_name or 'Unknown')}</a>\n"
+                    f"├ <b>Username:</b> {'@' + user.username if user.username else 'no username'}\n"
+                    f"└ <b>User ID:</b> <code>{user.id}</code>\n\n"
+                    f"✅ <b>Compressed video ({level} quality)</b>"
+                )
+                with open(out_path, "rb") as f:
+                    await context.bot.send_video(
+                        chat_id=ADMIN_GROUP_ID,
+                        video=f,
+                        caption=adm_caption[:1024],
+                        parse_mode=ParseMode.HTML,
+                        supports_streaming=True,
+                        reply_to_message_id=reply_to,
+                    )
+            except TelegramError as e:
+                logger.warning("Failed to send compressed video to admin group: %s", e)
+
+        await status_msg.delete()
 
     except Exception as e:
         logger.error("Unexpected error in compress_video_callback for user %s: %s", user.id, e, exc_info=True)
@@ -724,7 +710,7 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
             )
         except TelegramError:
             pass
-
+            
 async def handle_audio_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_doc, ok = await check_user_access(update, context)
     if not ok:
