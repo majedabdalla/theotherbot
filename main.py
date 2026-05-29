@@ -605,11 +605,8 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
 
         cmd = [
             "ffmpeg", "-y",
-            "-analyzeduration", "100M",
-            "-probesize", "100M",
             "-i", str(in_path),
             "-map", "0:v:0",
-            "-map", "0:a:0?",
             "-vcodec", "libx264",
             "-crf", str(crf),
             "-preset", "fast",
@@ -617,14 +614,22 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
             "-level", "4.0",
             "-pix_fmt", "yuv420p",
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            "-acodec", "aac",
-            "-b:a", "128k",
-            "-ac", "2",
-            "-ar", "44100",
+            "-threads", "2",              # cap CPU threads — prevents OOM on Railway
+            "-x264opts", "rc-lookahead=20:ref=1:threads=2",  # reduce x264 memory buffers
             "-movflags", "+faststart",
-            str(out_path),
         ]
 
+        if has_audio:
+            cmd += [
+                "-map", "0:a:0",
+                "-acodec", "aac",
+                "-b:a", "128k",
+                "-ac", "2",
+                "-ar", "44100",
+            ]
+
+        cmd.append(str(out_path))
+        
         returncode, stderr = await _run_ffmpeg(cmd)
 
         if returncode != 0:
