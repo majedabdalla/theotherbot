@@ -596,12 +596,26 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
 
     tg_file = await context.bot.get_file(video_file_id)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    try:
+      with tempfile.TemporaryDirectory() as tmpdir:
         orig_ext = Path(tg_file.file_path).suffix if tg_file.file_path else ".mp4"
         in_path  = Path(tmpdir) / f"input{orig_ext}"
         out_path = Path(tmpdir) / "output.mp4"
 
         await tg_file.download_to_drive(str(in_path))
+
+        # Probe for audio stream before building command
+        probe_proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=codec_type",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(in_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        probe_out, _ = await probe_proc.communicate()
+        has_audio = probe_out.strip() == b"audio"
 
         cmd = [
             "ffmpeg", "-y",
@@ -614,8 +628,8 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
             "-level", "4.0",
             "-pix_fmt", "yuv420p",
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            "-threads", "2",              # cap CPU threads — prevents OOM on Railway
-            "-x264opts", "rc-lookahead=20:ref=1:threads=2",  # reduce x264 memory buffers
+            "-threads", "2",
+            "-x264opts", "rc-lookahead=20:ref=1:threads=2",
             "-movflags", "+faststart",
         ]
 
@@ -701,6 +715,15 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
 
     await status_msg.delete()
 
+    except Exception as e:
+        logger.error("Unexpected error in compress_video_callback for user %s: %s", user.id, e, exc_info=True)
+        try:
+            await status_msg.edit_text(
+                "❌ <b>An unexpected error occurred.</b>\n\nPlease try again.",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            pass
 
 async def handle_audio_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_doc, ok = await check_user_access(update, context)
