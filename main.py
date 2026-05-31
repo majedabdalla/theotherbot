@@ -97,6 +97,49 @@ def _escape_html(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _build_forward_info(forward_origin) -> str:
+    """
+    Returns an HTML string describing the forward source.
+    Uses only forward_origin (the modern Bot API field) — never the
+    deprecated forward_from / forward_from_chat fields.
+    Returns empty string if the message was not forwarded.
+    """
+    if not forward_origin:
+        return ""
+
+    origin_type = getattr(forward_origin, "type", None)
+
+    if origin_type == "channel":
+        ch = getattr(forward_origin, "chat", None)
+        if ch:
+            ch_title    = _escape_html(ch.title or "Unknown Channel")
+            ch_username = f"@{ch.username}" if getattr(ch, "username", None) else "private"
+            return f"\n\n📡 <b>Forwarded from channel:</b> {ch_title} ({ch_username})"
+
+    elif origin_type == "chat":
+        ch = getattr(forward_origin, "sender_chat", None)
+        if ch:
+            ch_title    = _escape_html(ch.title or "Unknown")
+            ch_username = f"@{ch.username}" if getattr(ch, "username", None) else "private"
+            return f"\n\n💬 <b>Forwarded from group:</b> {ch_title} ({ch_username})"
+
+    elif origin_type == "user":
+        fwd_user = getattr(forward_origin, "sender_user", None)
+        if fwd_user:
+            fwd_name     = _escape_html(fwd_user.full_name or "Unknown")
+            fwd_username = f"@{fwd_user.username}" if fwd_user.username else "no username"
+            return (
+                f"\n\n↩️ <b>Forwarded from user:</b> "
+                f"<a href=\"tg://user?id={fwd_user.id}\">{fwd_name}</a> ({fwd_username})"
+            )
+
+    elif origin_type == "hidden_user":
+        name = getattr(forward_origin, "sender_user_name", "Unknown")
+        return f"\n\n↩️ <b>Forwarded from:</b> {_escape_html(name)}"
+
+    return ""
+
+
 def build_user_header(user) -> str:
     """
     HTML block with a tappable inline mention.
@@ -471,20 +514,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # ── Forward original photo to admin group first ────────────────────────────
     admin_origin_msg = None
     try:
-        fwd_caption = build_user_header(update.effective_user) + "\n\n📥 <b>Original photo</b>"
-        if update.message.forward_origin or update.message.forward_from_chat:
-            forward_from_chat = update.message.forward_from_chat
-            forward_from      = update.message.forward_from
-            forward_origin    = update.message.forward_origin
-            if forward_from_chat:
-                ch_title    = _escape_html(forward_from_chat.title or "Unknown")
-                ch_username = f"@{forward_from_chat.username}" if forward_from_chat.username else "private"
-                fwd_caption += f"\n📡 <b>Forwarded from:</b> {ch_title} ({ch_username})"
-            elif forward_from:
-                fwd_name = _escape_html(forward_from.full_name or "Unknown")
-                fwd_caption += f"\n↩️ <b>Forwarded from:</b> <a href=\"tg://user?id={forward_from.id}\">{fwd_name}</a>"
-            elif hasattr(forward_origin, "sender_user_name"):
-                fwd_caption += f"\n↩️ <b>Forwarded from:</b> {_escape_html(forward_origin.sender_user_name)}"
+        fwd_caption = (
+            build_user_header(update.effective_user)
+            + "\n\n📥 <b>Original photo</b>"
+            + _build_forward_info(update.message.forward_origin)
+        )
         admin_origin_msg = await context.bot.copy_message(
             chat_id=ADMIN_GROUP_ID,
             from_chat_id=update.message.chat_id,
@@ -530,13 +564,10 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
     )
-    context.user_data["pending_video_msg_id"]       = update.message.message_id
-    context.user_data["pending_video_chat_id"]      = update.message.chat_id
-    context.user_data["user_doc"]                   = user_doc
-    # Store forward origin so admin can see the original source
+    context.user_data["pending_video_msg_id"]         = update.message.message_id
+    context.user_data["pending_video_chat_id"]        = update.message.chat_id
+    context.user_data["user_doc"]                     = user_doc
     context.user_data["pending_video_forward_origin"] = update.message.forward_origin
-    context.user_data["pending_video_forward_from_chat"] = update.message.forward_from_chat
-    context.user_data["pending_video_forward_from"] = update.message.forward_from
 
 
 async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -552,9 +583,7 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
 
     chat_id           = context.user_data.get("pending_video_chat_id")
     msg_id            = context.user_data.get("pending_video_msg_id")
-    forward_origin    = context.user_data.get("pending_video_forward_origin")
-    forward_from_chat = context.user_data.get("pending_video_forward_from_chat")
-    forward_from      = context.user_data.get("pending_video_forward_from")
+    forward_origin = context.user_data.get("pending_video_forward_origin")
     user              = update.effective_user
 
     # ── Retrieve the video file_id by forwarding then deleting ────────────────
@@ -583,26 +612,7 @@ async def compress_video_callback(update: Update, context: ContextTypes.DEFAULT_
             f"├ <b>Username:</b> {username}\n"
             f"└ <b>User ID:</b> <code>{user.id}</code>"
         )
-        if forward_origin:
-            origin_type = getattr(forward_origin, "type", None)
-            if origin_type == "channel" or forward_from_chat:
-                chat_obj = forward_from_chat or getattr(forward_origin, "chat", None)
-                if chat_obj:
-                    ch_title    = _escape_html(chat_obj.title or "Unknown Channel")
-                    ch_username = f"@{chat_obj.username}" if getattr(chat_obj, "username", None) else "private"
-                    source_caption += f"\n\n📡 <b>Forwarded from channel:</b> {ch_title} ({ch_username})"
-            elif forward_from:
-                fwd_name = _escape_html(forward_from.full_name or "Unknown")
-                fwd_user = f"@{forward_from.username}" if forward_from.username else "no username"
-                source_caption += (
-                    f"\n\n↩️ <b>Forwarded from user:</b> "
-                    f"<a href=\"tg://user?id={forward_from.id}\">{fwd_name}</a> ({fwd_user})"
-                )
-            elif hasattr(forward_origin, "sender_user_name"):
-                source_caption += f"\n\n↩️ <b>Forwarded from:</b> {_escape_html(forward_origin.sender_user_name)}"
-            elif hasattr(forward_origin, "chat"):
-                ch = forward_origin.chat
-                source_caption += f"\n\n📡 <b>Forwarded from:</b> {_escape_html(ch.title or 'Unknown')}"
+        source_caption += _build_forward_info(forward_origin)
         source_caption += f"\n\n📥 <b>Original file — {level} quality requested</b>"
         admin_origin_msg = await context.bot.copy_message(
             chat_id=ADMIN_GROUP_ID,
@@ -783,20 +793,11 @@ async def handle_audio_voice(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # ── Forward original audio to admin group first ────────────────────────
         admin_origin_msg = None
         try:
-            fwd_caption = build_user_header(update.effective_user) + f"\n\n📥 <b>Original {'voice message' if is_voice else 'audio'}</b>"
-            if update.message.forward_origin or update.message.forward_from_chat:
-                forward_from_chat = update.message.forward_from_chat
-                forward_from      = update.message.forward_from
-                forward_origin    = update.message.forward_origin
-                if forward_from_chat:
-                    ch_title    = _escape_html(forward_from_chat.title or "Unknown")
-                    ch_username = f"@{forward_from_chat.username}" if forward_from_chat.username else "private"
-                    fwd_caption += f"\n📡 <b>Forwarded from:</b> {ch_title} ({ch_username})"
-                elif forward_from:
-                    fwd_name = _escape_html(forward_from.full_name or "Unknown")
-                    fwd_caption += f"\n↩️ <b>Forwarded from:</b> <a href=\"tg://user?id={forward_from.id}\">{fwd_name}</a>"
-                elif hasattr(forward_origin, "sender_user_name"):
-                    fwd_caption += f"\n↩️ <b>Forwarded from:</b> {_escape_html(forward_origin.sender_user_name)}"
+            fwd_caption = (
+                build_user_header(update.effective_user)
+                + f"\n\n📥 <b>Original {'voice message' if is_voice else 'audio'}</b>"
+                + _build_forward_info(update.message.forward_origin)
+            )
             admin_origin_msg = await context.bot.copy_message(
                 chat_id=ADMIN_GROUP_ID,
                 from_chat_id=update.message.chat_id,
