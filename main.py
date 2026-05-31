@@ -54,6 +54,7 @@ ADMIN_IDS:        list[int] = [int(x) for x in os.environ.get("ADMIN_IDS", "").s
 PAYEER_ADDRESS:   str       = os.environ.get("PAYEER_ADDRESS", "P1000000")
 BOT_NAME:         str       = os.environ.get("BOT_NAME", "CompressBot")
 FREE_DAILY_LIMIT: int       = int(os.environ.get("FREE_DAILY_LIMIT", "5"))
+REQUIRED_CHANNEL:     str = os.environ.get("REQUIRED_CHANNEL", "")  # e.g. "@mychannel"
 
 # ── Thread pool for CPU-heavy Pillow work ─────────────────────────────────────
 MAX_WORKERS: int = int(os.environ.get("MAX_WORKERS", "3"))
@@ -156,7 +157,17 @@ async def send_media_to_admin(
 # ══════════════════════════════════════════════════════════════════════════════
 #  HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
-
+async def is_channel_member(bot, user_id: int) -> bool:
+    """Returns True if user is a member of REQUIRED_CHANNEL, or if no channel is set."""
+    if not REQUIRED_CHANNEL:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=user_id)
+        return member.status not in ("left", "kicked")
+    except TelegramError:
+        # If the check fails for any reason, don't block the user
+        return True
+        
 async def check_user_access(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> tuple[dict | None, bool]:
@@ -172,6 +183,21 @@ async def check_user_access(
     if is_admin(user.id):
         user_doc = {**user_doc, "status": "premium"}
         return user_doc, True
+
+    # ── Channel membership gate ────────────────────────────────────────────────
+    if REQUIRED_CHANNEL and not await is_channel_member(context.bot, user.id):
+        channel_url = f"https://t.me/{REQUIRED_CHANNEL.lstrip('@')}"
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📢 Join Channel", url=channel_url),
+        ]])
+        await update.message.reply_text(
+            "⚠️ <b>You must join our channel to use this bot.</b>\n\n"
+            "1. Click the button below to join\n"
+            "2. Come back and send your file again",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+        return user_doc, False
 
     if user_doc.get("status") == "premium":
         return user_doc, True
