@@ -932,26 +932,64 @@ async def cmd_depremium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(f"⚠️ User <code>{uid}</code> not found in DB.", parse_mode=ParseMode.HTML)
 
 
+def _resolve_target_token(target_token: str) -> int | None:
+    """
+    Parses a user_id or @username string into a bare int user_id when possible.
+    Returns None if it's a username (needs an async DB lookup instead).
+    """
+    bare = target_token.lstrip("@")
+    return int(bare) if bare.isdigit() else None
+
+
+async def _resolve_admin_target(target_token: str) -> int | None:
+    """
+    Resolves a /send target argument (numeric ID or @username) to a user_id,
+    looking the username up in the DB if needed. Returns None if not found.
+    """
+    direct_id = _resolve_target_token(target_token)
+    if direct_id is not None:
+        return direct_id
+
+    user_doc = await db.get_user_by_username(target_token)
+    return user_doc["user_id"] if user_doc else None
+
+
 @admin_only
 async def cmd_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if len(context.args) < 2:
+    """
+    Admin command to send anything to any user, in two ways:
+
+      1. Reply mode — reply to ANY message (text, photo, video, document,
+         voice, sticker, etc.) with:
+             /send <user_id or @username>
+         and that exact message is copied to the target user as-is.
+
+      2. Inline text mode — no reply needed:
+             /send <user_id or @username> <text>
+         sends a plain text message to the target user.
+    """
+    replied = update.message.reply_to_message
+
+    if not context.args:
         await update.message.reply_text(
-            "Usage: <code>/send &lt;user_id or @username&gt; &lt;message&gt;</code>",
+            "Usage:\n"
+            "<code>/send &lt;user_id or @username&gt; &lt;message&gt;</code>\n"
+            "— or reply to any message/file with —\n"
+            "<code>/send &lt;user_id or @username&gt;</code>",
             parse_mode=ParseMode.HTML,
         )
         return
 
     target_token = context.args[0]
-    text         = " ".join(context.args[1:])
-    target_id: int | None = None
+    text_args    = context.args[1:]
 
-    if target_token.lstrip("@").isdigit():
-        target_id = int(target_token.lstrip("@"))
-    else:
-        user_doc = await db.get_user_by_username(target_token)
-        if user_doc:
-            target_id = user_doc["user_id"]
+    if not replied and not text_args:
+        await update.message.reply_text(
+            "⚠️ Provide a message after the username/ID, or reply to a message/file to send it.",
+        )
+        return
 
+    target_id = await _resolve_admin_target(target_token)
     if target_id is None:
         await update.message.reply_text(
             f"⚠️ Could not find a user matching <code>{target_token}</code> in the database.",
@@ -960,12 +998,22 @@ async def cmd_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     try:
-        await context.bot.send_message(
-            chat_id=target_id,
-            text=f"📩 <b>Message from Admin:</b>\n\n{text}",
-            parse_mode=ParseMode.HTML,
-        )
-        await update.message.reply_text(f"✅ Message delivered to <code>{target_id}</code>.", parse_mode=ParseMode.HTML)
+        if replied:
+            # Copies the replied-to message exactly as-is — works for text,
+            # photos, videos, documents, voice notes, stickers, anything.
+            await context.bot.copy_message(
+                chat_id=target_id,
+                from_chat_id=replied.chat_id,
+                message_id=replied.message_id,
+            )
+        else:
+            text = " ".join(text_args)
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=f"📩 <b>Message from Admin:</b>\n\n{text}",
+                parse_mode=ParseMode.HTML,
+            )
+        await update.message.reply_text(f"✅ Delivered to <code>{target_id}</code>.", parse_mode=ParseMode.HTML)
     except Forbidden:
         await update.message.reply_text(
             f"❌ Cannot send: user <code>{target_id}</code> has blocked the bot.",
